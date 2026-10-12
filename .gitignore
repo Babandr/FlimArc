@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.sdt
+*.ptu
+*.tif
+*.tiff
+*.npy
+*.h5
+results/
+data/
+.vscode/
+Thumbs.db
+desktop.ini
