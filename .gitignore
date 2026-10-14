@@ -6,7 +6,6 @@ venv/
 *.ptu
 *.tif
 *.tiff
-*.npy
 *.h5
 results/
 data/
