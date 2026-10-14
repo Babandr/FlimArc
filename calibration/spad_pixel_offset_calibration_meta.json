@@ -1,0 +1,21 @@
+{
+  "description": "Per-pixel SPAD timing offset calibration map. Each value is the offset (ps) of that pixel's IRF peak relative to the sensor-wide median, measured from a 120 s DASPI IRF acquisition (63x objective, low100p laser, nd0.5 filter). Shape is (H, W) after the standard 90-deg CCW rotation applied by flim_core.io.load_flim_data \u2014 apply to cube in that same orientation. NaN pixels had insufficient photons (<30 counts) and are skipped.",
+  "source_file": "63x_daspi_low100p_nd0p5_120s.ds3d",
+  "objective": "63x water",
+  "sample": "DASPI in water",
+  "laser_power": "low 100%",
+  "nd_filter": "0.5",
+  "exposure_s": 120,
+  "tpb_ps": 37.4,
+  "sensor_shape_hw": [
+    126,
+    192
+  ],
+  "median_peak_ps": 2269.376132827997,
+  "offset_std_ps": 103.06671078442272,
+  "noise_sigma_ps": 7.7,
+  "valid_pixels": 21389,
+  "total_pixels": 24192,
+  "units": "picoseconds",
+  "created": "2026-10-14"
+}

@@ -42,6 +42,7 @@ from flim_core.irf import (
     mean_arrival_time_reconv,
     plot_irf_diagnostic,
 )
+from flim_core.pixel_offset import PixelOffsetCorrection
 from analyses._common import build_group_cube
 
 NAME = "Normal (pixel-wise)"
@@ -115,6 +116,19 @@ def process_file(h5file, args):
     report_dead_pixels(img)
 
     cube = build_decay_cube(s)
+
+    # Per-pixel SPAD timing offset correction -- applied before any spatial
+    # binning or ROI crop so every downstream step sees aligned histograms.
+    # Skipped when args.pixel_offset is None (the default / checkbox unchecked).
+    pixel_offset_path = getattr(args, "pixel_offset", None)
+    if pixel_offset_path:
+        print(f"\nApplying pixel offset correction from {Path(pixel_offset_path).name} ...")
+        try:
+            corr = PixelOffsetCorrection.load(pixel_offset_path)
+            cube = corr.apply(cube, s["tpb"])
+        except Exception as exc:
+            print(f"  WARNING: pixel offset correction failed ({exc}); continuing without it.")
+
     roi = args.roi
     if roi is None and args.roi_prompt:
         roi = prompt_roi(s["W"], s["H"])

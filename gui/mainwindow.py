@@ -64,6 +64,7 @@ from flim_core.config import (
     DISPLAY_ASPECT, MIN_NEIGHBORS, BIN_SIZE, DEFAULT_THRESHOLD, TAIL_START_OFFSET,
     TAU_SHORT_BOUNDS, TAU_LONG_BOUNDS, TAU_MONO_BOUNDS,
 )
+from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.io import load_flim_data, _find_histogram_group
 from flim_core.masking import clean_mask, bin_cube, moving_average_cube, crop_to_roi, save_mask, load_mask
 from flim_core.fitting import AnalysisCancelled
@@ -742,6 +743,55 @@ class FlimMasterApp(tk.Tk):
 
         self._show_fit_method_settings()
 
+        # ── Pixel offset correction (always visible, independent of fit method) ──
+        f_off = ttk.LabelFrame(parent, text="Pixel offset correction")
+        f_off.pack(fill="x", pady=(0, 8))
+
+        self.pixel_offset_var = tk.BooleanVar(value=False)
+        self.pixel_offset_path = None
+        ttk.Checkbutton(
+            f_off, text="Apply per-pixel SPAD timing offset correction",
+            variable=self.pixel_offset_var,
+            command=self._update_pixel_offset_state,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(
+            f_off,
+            text="Corrects the fixed per-pixel TDC offset measured from an IRF "
+                 "calibration file (.npy). Apply before fitting to remove systematic "
+                 "timing spread (~103 ps rms) across the sensor. "
+                 "Uncheck to run without correction for a side-by-side comparison.",
+            foreground="#777", font=("", 8), wraplength=260,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4)
+
+        self._pixel_offset_btn = ttk.Button(
+            f_off, text="Select calibration .npy...",
+            command=self._select_pixel_offset_file, state="disabled",
+        )
+        self._pixel_offset_btn.grid(row=2, column=0, sticky="w", padx=4, pady=(6, 0))
+        self._pixel_offset_label = ttk.Label(
+            f_off, text="No calibration file selected",
+            foreground="#777", font=("", 8), wraplength=220,
+        )
+        self._pixel_offset_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
+
+    def _update_pixel_offset_state(self):
+        state = "normal" if self.pixel_offset_var.get() else "disabled"
+        self._pixel_offset_btn.config(state=state)
+        if not self.pixel_offset_var.get():
+            self.pixel_offset_path = None
+            self._pixel_offset_label.config(text="No calibration file selected",
+                                            foreground="#777")
+
+    def _select_pixel_offset_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("NumPy array", "*.npy"), ("All files", "*.*")],
+            title="Select pixel offset calibration .npy file",
+        )
+        if not path:
+            return
+        self.pixel_offset_path = path
+        self._pixel_offset_label.config(text=Path(path).name, foreground="#333")
+
     def _update_irf_window_end_state(self):
         self.irf_window_end_entry.config(state="normal" if self.irf_full_var.get() else "disabled")
 
@@ -1179,6 +1229,8 @@ class FlimMasterApp(tk.Tk):
             no_shift=self.no_shift_var.get() if fit_method in ("irf", "mean_irf") else False,
             irf_full=self.irf_full_var.get() if fit_method in ("irf", "mean_irf") else False,
             irf_window_end_ns=self.irf_window_end_ns_var.get(),
+            pixel_offset_path=(self.pixel_offset_path
+                               if self.pixel_offset_var.get() else None),
             selection_mode=selection_mode,
             roi_bounds=roi_bounds,
             external_mask_path=external_mask_path,
@@ -1220,6 +1272,7 @@ class FlimMasterApp(tk.Tk):
         ns.no_shift = settings["no_shift"]
         ns.irf_full = settings["irf_full"]
         ns.irf_window_end_ns = settings["irf_window_end_ns"]
+        ns.pixel_offset = settings["pixel_offset_path"]
         ns.tau_short_bounds = settings["tau_short_bounds"]
         ns.tau_long_bounds = settings["tau_long_bounds"]
         ns.tau_mono_bounds = settings["tau_mono_bounds"]
