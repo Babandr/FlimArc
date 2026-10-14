@@ -18,7 +18,8 @@ from .io import load_flim_data, build_decay_cube
 from .fitting import _resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff
 
 
-def load_irf(path, window=True, window_end_ns=15.0, time_bin=1):
+def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
+             pixel_offset_path=None):
     """Load an IRF measurement file (any of the three Flimera HDF5 formats,
     same loader as the main script) and reduce it to a single normalized
     instrument-response curve, summed over every pixel -- the IRF shape is a
@@ -79,9 +80,38 @@ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1):
     reconvolution model's two time grids no longer line up. The returned
     dict's `tpb` is the binned bin width (original tpb * time_bin), and
     nb/peak_bin/window are all in binned-bin units, so callers can treat
-    the result exactly like an IRF loaded from natively-coarser data."""
+    the result exactly like an IRF loaded from natively-coarser data.
+
+    pixel_offset_path: path to a PixelOffsetCorrection .npy calibration
+    file (see flim_core.pixel_offset). When provided, each pixel's decay
+    histogram in the IRF measurement is shifted to remove its individual
+    TDC timing offset BEFORE the per-pixel histograms are summed. This
+    makes the integrated IRF kernel sharper and more representative of the
+    true single-pixel instrument response -- without correction, the sum of
+    ~21 k misaligned peaks broadens the apparent IRF peak by ~36% and
+    suppresses its amplitude by the same factor, causing the reconvolution
+    fit to systematically overestimate τ_short. Should always be set to the
+    same calibration file used to correct the data cube (see normal.py's
+    pixel_offset block) so that data and IRF kernel are corrected
+    consistently."""
     s = load_flim_data(path)
     cube = build_decay_cube(s)
+
+    # Per-pixel offset correction on the IRF cube -- applied before summation
+    # so the integrated kernel reflects the true single-pixel IRF shape rather
+    # than the smeared superposition of misaligned peaks. Must be applied here,
+    # before time_bin rebinning, because the calibration map is in native bins.
+    if pixel_offset_path is not None:
+        from .pixel_offset import PixelOffsetCorrection
+        try:
+            corr = PixelOffsetCorrection.load(pixel_offset_path)
+            cube = corr.apply(cube, s["tpb"])
+            print(f"  [load_irf] pixel offset correction applied to IRF cube "
+                  f"({corr.valid_mask.sum()} / {corr.offset_ps.size} pixels corrected)")
+        except Exception as exc:
+            print(f"  [load_irf] WARNING: pixel offset correction failed ({exc}); "
+                  f"IRF will be built from uncorrected cube.")
+
     raw = cube.sum(axis=(0, 1)).astype(float)          # summed over all pixels
     if time_bin and time_bin > 1:
         nbc = (len(raw) // time_bin) * time_bin

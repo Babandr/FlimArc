@@ -193,7 +193,8 @@ def run(args):
               f"({'full trace (echoes kept)' if irf_full else 'windowed to the main peak'}) ...")
         irf = load_irf(irf_path, window=not irf_full,
                        window_end_ns=getattr(args, "irf_window_end_ns", 15.0),
-                       time_bin=(getattr(args, "time_bin", None) or 1))
+                       time_bin=(getattr(args, "time_bin", None) or 1),
+                       pixel_offset_path=getattr(args, "pixel_offset", None))
         if no_shift:
             print("  --no-shift: IRF/data timing offset fixed at 0 (not fitted) -- "
                   "only appropriate if IRF and data were acquired at matched laser settings.")

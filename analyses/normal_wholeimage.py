@@ -31,6 +31,7 @@ from flim_core.masking import (
 )
 from flim_core.fitting import _tail_axis, global_fit
 from flim_core.irf import load_irf, estimate_shift, shift_array, plot_irf_diagnostic
+from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.plotting import plot_overview_and_mask
 from analyses._common import (
     global_fit_fixed_short, plot_window_fit, build_group_cube,
@@ -108,7 +109,8 @@ def process_file(h5file, args):
               f"({'full trace (echoes kept)' if irf_full else 'windowed to the main peak'}) ...")
         irf = load_irf(irf_path, window=not irf_full,
                        window_end_ns=getattr(args, "irf_window_end_ns", 15.0),
-                       time_bin=(getattr(args, "time_bin", None) or 1))
+                       time_bin=(getattr(args, "time_bin", None) or 1),
+                       pixel_offset_path=getattr(args, "pixel_offset", None))
         print(f"  IRF: {irf['source']} | {irf['n_photons']} raw photons | "
               f"FWHM {irf['fwhm_bins']} bins ({irf['fwhm_bins']*irf['tpb']*1e9:.2f} ns) | "
               f"{irf['bg_fraction']*100:.0f}% of raw counts were flat background (removed)")
@@ -130,6 +132,21 @@ def process_file(h5file, args):
     report_dead_pixels(img)
 
     cube = build_decay_cube(s)
+
+    # Per-pixel SPAD timing offset correction -- applied before any spatial
+    # binning or ROI crop so every downstream step sees aligned histograms.
+    # Skipped when args.pixel_offset is None (the default / checkbox unchecked).
+    pixel_offset_path = getattr(args, "pixel_offset", None)
+    pixel_offset_meta = "none"
+    if pixel_offset_path:
+        print(f"\nApplying pixel offset correction from {Path(pixel_offset_path).name} ...")
+        try:
+            corr = PixelOffsetCorrection.load(pixel_offset_path)
+            cube = corr.apply(cube, s["tpb"])
+            pixel_offset_meta = str(Path(pixel_offset_path).resolve())
+        except Exception as exc:
+            print(f"  WARNING: pixel offset correction failed ({exc}); continuing without it.")
+
     roi = args.roi
     if roi is None and args.roi_prompt:
         roi = prompt_roi(s["W"], s["H"])
@@ -273,7 +290,8 @@ def process_file(h5file, args):
                  photons_per_pixel=img, mask=mask, n_photons=n_photons,
                  tau_mean_ns=tau_mean, tau_mean_std_ns=tau_mean_std, irf_shift=shift,
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -300,7 +318,8 @@ def process_file(h5file, args):
                  photons_per_pixel=img, mask=mask, n_photons=n_photons,
                  tau_mean_ns=tau_mean, tau_mean_std_ns=tau_mean_std,
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -340,7 +359,8 @@ def process_file(h5file, args):
                      photons_per_pixel=img, mask=mask, n_photons=n_photons,
                      tau_ns=g["tau"], tau_std_ns=g.get("tau_std", np.nan), model="mono", irf_shift=shift,
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         else:
             print(f"  tau_short_std = {g.get('tau_short_std', float('nan')):.3f} ns, "
                   f"tau_long_std = {g.get('tau_long_std', float('nan')):.3f} ns  (n_photons = {n_photons})")
@@ -350,7 +370,8 @@ def process_file(h5file, args):
                      tau_short_std_ns=g.get("tau_short_std", np.nan), tau_long_std_ns=g.get("tau_long_std", np.nan),
                      model="bi", irf_shift=shift,
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -392,7 +413,8 @@ def process_file(h5file, args):
                  photons_per_pixel=img, mask=mask, n_photons=n_photons,
                  tau_ns=g["tau"], tau_std_ns=g.get("tau_std", np.nan), model="mono",
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
     else:
         print(f"  tau_short_std = {g.get('tau_short_std', float('nan')):.3f} ns, "
               f"tau_long_std = {g.get('tau_long_std', float('nan')):.3f} ns  (n_photons = {n_photons})")
@@ -401,7 +423,8 @@ def process_file(h5file, args):
                  tau_short_ns=g["tau_short"], tau_long_ns=g["tau_long"],
                  tau_short_std_ns=g.get("tau_short_std", np.nan), tau_long_std_ns=g.get("tau_long_std", np.nan),
                  model="bi", threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
     print(f"  saved {prefix}_maps.npz")
     print(f"Done with {h5file}.")
 

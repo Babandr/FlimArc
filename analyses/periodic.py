@@ -87,9 +87,12 @@ def plot_phase_summary(results, n_groups, period_s, prefix, show, mono):
 
     out_npz = f"{prefix}_phase_summary.npz"
     n_pixels = [r["n_pixels"] if r is not None else 0 for r in results]
+    pixel_offset_path = getattr(args, "pixel_offset", None)
     np.savez(out_npz, phase_center_s=np.array(centers), median=np.array(medians),
              iqr_low=np.array(lo), iqr_high=np.array(hi), n_pixels=np.array(n_pixels),
-             period_s=period_s, n_groups=n_groups, mono=mono)
+             period_s=period_s, n_groups=n_groups, mono=mono,
+             pixel_offset_calibration=str(Path(pixel_offset_path).resolve())
+             if pixel_offset_path else "none")
     print(f"Saved phase summary data: {out_npz}")
 
 
@@ -206,7 +209,8 @@ def run(args):
               f"({'full trace (echoes kept)' if irf_full else 'windowed to the main peak'}) ...")
         irf = load_irf(irf_path, window=not irf_full,
                        window_end_ns=getattr(args, "irf_window_end_ns", 15.0),
-                       time_bin=(getattr(args, "time_bin", None) or 1))
+                       time_bin=(getattr(args, "time_bin", None) or 1),
+                       pixel_offset_path=getattr(args, "pixel_offset", None))
         print(f"  IRF: {irf['source']} | {irf['n_photons']} raw photons | "
               f"FWHM {irf['fwhm_bins']} bins ({irf['fwhm_bins']*irf['tpb']*1e9:.2f} ns) | "
               f"{irf['bg_fraction']*100:.0f}% of raw counts were flat background (removed)")

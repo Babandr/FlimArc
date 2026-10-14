@@ -198,7 +198,8 @@ def run(args):
               f"({'full trace (echoes kept)' if irf_full else 'windowed to the main peak'}) ...")
         irf = load_irf(irf_path, window=not irf_full,
                        window_end_ns=getattr(args, "irf_window_end_ns", 15.0),
-                       time_bin=(getattr(args, "time_bin", None) or 1))
+                       time_bin=(getattr(args, "time_bin", None) or 1),
+                       pixel_offset_path=getattr(args, "pixel_offset", None))
         print(f"  IRF: {irf['source']} | {irf['n_photons']} raw photons | "
               f"FWHM {irf['fwhm_bins']} bins ({irf['fwhm_bins']*irf['tpb']*1e9:.2f} ns) | "
               f"{irf['bg_fraction']*100:.0f}% of raw counts were flat background (removed)")

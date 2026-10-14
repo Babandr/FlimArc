@@ -85,7 +85,8 @@ def process_file(h5file, args):
               f"({'full trace (echoes kept)' if irf_full else 'windowed to the main peak'}) ...")
         irf = load_irf(irf_path, window=not irf_full,
                        window_end_ns=getattr(args, "irf_window_end_ns", 15.0),
-                       time_bin=(getattr(args, "time_bin", None) or 1))
+                       time_bin=(getattr(args, "time_bin", None) or 1),
+                       pixel_offset_path=getattr(args, "pixel_offset", None))
         print(f"  IRF: {irf['source']} | {irf['n_photons']} raw photons | "
               f"FWHM {irf['fwhm_bins']} bins ({irf['fwhm_bins']*irf['tpb']*1e9:.2f} ns) | "
               f"{irf['bg_fraction']*100:.0f}% of raw counts were flat background (removed)")
@@ -121,11 +122,13 @@ def process_file(h5file, args):
     # binning or ROI crop so every downstream step sees aligned histograms.
     # Skipped when args.pixel_offset is None (the default / checkbox unchecked).
     pixel_offset_path = getattr(args, "pixel_offset", None)
+    pixel_offset_meta = "none"   # written into every .npz for reproducibility
     if pixel_offset_path:
         print(f"\nApplying pixel offset correction from {Path(pixel_offset_path).name} ...")
         try:
             corr = PixelOffsetCorrection.load(pixel_offset_path)
             cube = corr.apply(cube, s["tpb"])
+            pixel_offset_meta = str(Path(pixel_offset_path).resolve())
         except Exception as exc:
             print(f"  WARNING: pixel offset correction failed ({exc}); continuing without it.")
 
@@ -332,7 +335,8 @@ def process_file(h5file, args):
                  tau_mean_ns=fit["tau_mean"], tau_mean_std_ns=fit["tau_mean_std"],
                  n_photons_fit=fit["n_photons"], irf_shift=fit["shift"],
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -359,7 +363,8 @@ def process_file(h5file, args):
                  tau_mean_ns=fit["tau_mean"], tau_mean_std_ns=fit["tau_mean_std"],
                  n_photons_fit=fit["n_photons"],
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -435,7 +440,8 @@ def process_file(h5file, args):
                  converged=fit["converged"], nll=fit["nll"], model="mono",
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size,
                  tau_global=g["tau"], tau_global_std=g.get("tau_std", np.nan), fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
     else:
         tau_long, tau_short = fit["tau_long"], fit["tau_short"]
         tlv = tau_long[np.isfinite(tau_long)]
@@ -459,7 +465,8 @@ def process_file(h5file, args):
                  tau_short_global=g["tau_short"], tau_long_global=g["tau_long"],
                  tau_short_global_std=g.get("tau_short_std", np.nan),
                  tau_long_global_std=g.get("tau_long_std", np.nan), fit_method=fit_method,
-                 moving_average=(moving_avg or 1), time_bin=time_bin)
+                 moving_average=(moving_avg or 1), time_bin=time_bin,
+                 pixel_offset_calibration=pixel_offset_meta)
     print(f"  saved {prefix}_maps.npz")
     print(f"Done with {h5file}.")
 

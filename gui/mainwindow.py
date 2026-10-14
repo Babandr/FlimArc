@@ -774,16 +774,44 @@ class FlimMasterApp(tk.Tk):
         )
         self._pixel_offset_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
 
+    @staticmethod
+    def _find_default_calibration() -> Path | None:
+        """Return the path to the default calibration file if it exists.
+
+        Looks for  <repo_root>/calibration/spad_pixel_offset_calibration.npy
+        where <repo_root> is the directory that contains this gui/ package.
+        Returns None silently if the file is not found so the checkbox still
+        works -- the user can pick a file manually."""
+        here = Path(__file__).resolve().parent   # gui/
+        candidate = here.parent / "calibration" / "spad_pixel_offset_calibration.npy"
+        return candidate if candidate.exists() else None
+
     def _update_pixel_offset_state(self):
-        state = "normal" if self.pixel_offset_var.get() else "disabled"
-        self._pixel_offset_btn.config(state=state)
-        if not self.pixel_offset_var.get():
+        enabled = self.pixel_offset_var.get()
+        self._pixel_offset_btn.config(state="normal" if enabled else "disabled")
+        if not enabled:
             self.pixel_offset_path = None
             self._pixel_offset_label.config(text="No calibration file selected",
                                             foreground="#777")
+        else:
+            # Auto-select the default calibration file if nothing is chosen yet
+            if self.pixel_offset_path is None:
+                default = self._find_default_calibration()
+                if default is not None:
+                    self.pixel_offset_path = str(default)
+                    self._pixel_offset_label.config(
+                        text=f"{default.name}  (default)", foreground="#4a9")
+                else:
+                    self._pixel_offset_label.config(
+                        text="Default not found — please select a file",
+                        foreground="#c84")
 
     def _select_pixel_offset_file(self):
+        # Start the file picker in the default calibration directory if it exists
+        default = self._find_default_calibration()
+        initial_dir = str(default.parent) if default else None
         path = filedialog.askopenfilename(
+            initialdir=initial_dir,
             filetypes=[("NumPy array", "*.npy"), ("All files", "*.*")],
             title="Select pixel offset calibration .npy file",
         )
@@ -1017,15 +1045,38 @@ class FlimMasterApp(tk.Tk):
     def open_decay_viewer(self):
         """Open (or re-focus, if already open) the per-pixel decay curve
         inspector for the currently loaded file. Never re-reads the file --
-        passes along the same loaded_data the main window already has."""
+        passes along the same loaded_data the main window already has.
+
+        If the pixel offset correction checkbox is enabled and a calibration
+        file is selected, the correction is applied to a COPY of the loaded
+        cube before it is handed to the viewer -- the original loaded_data is
+        never mutated so the main analysis pipeline is unaffected."""
         if self.filepath is None or self.loaded_data is None:
             return
         if self.decay_viewer_window is not None and self.decay_viewer_window.winfo_exists():
             self.decay_viewer_window.lift()
             self.decay_viewer_window.focus_force()
             return
+
+        viewer_data = self.loaded_data   # default: pass original reference
+        if (self.pixel_offset_var.get()
+                and self.pixel_offset_path
+                and self.file_type != "raw"):   # raw photon-stream files use per-photon
+                                                # arrival times, not a pre-built cube
+            try:
+                corr = PixelOffsetCorrection.load(self.pixel_offset_path)
+                corrected_cube = corr.apply(
+                    self.loaded_data["cube"], self.loaded_data["tpb"])
+                # Shallow copy: only replace the cube key, keep everything else
+                viewer_data = dict(self.loaded_data, cube=corrected_cube)
+                print(f"  [decay viewer] pixel offset correction applied "
+                      f"({Path(self.pixel_offset_path).name})")
+            except Exception as exc:
+                print(f"  [decay viewer] WARNING: pixel offset correction failed "
+                      f"({exc}); showing uncorrected decay.")
+
         self.decay_viewer_window = DecayViewer(
-            self, self.loaded_data, self.file_type, Path(self.filepath).name)
+            self, viewer_data, self.file_type, Path(self.filepath).name)
 
     # -- plugin selection ---------------------------------------------------
     def _set_plugin_availability(self):
