@@ -774,6 +774,26 @@ class FlimMasterApp(tk.Tk):
         )
         self._pixel_offset_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
 
+        # ── 8-bin TDC clock pattern correction (self-calibrating) ────────────────
+        f_bp = ttk.LabelFrame(parent, text="8-bin pattern correction")
+        f_bp.pack(fill="x", pady=(0, 8))
+
+        self.bin_pattern_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            f_bp, text="Apply 8-bin TDC clock pattern correction",
+            variable=self.bin_pattern_var,
+        ).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(
+            f_bp,
+            text="Removes the ~10–15% per-bin sensitivity oscillation caused by "
+                 "the TDC clock cycle. Self-calibrating: the 8 correction factors "
+                 "are measured from the sum histogram of each file automatically — "
+                 "no separate calibration file needed. Apply before pixel-offset "
+                 "correction and spatial binning. Phase varies per session so "
+                 "cannot be pre-calibrated.",
+            foreground="#777", font=("", 8), wraplength=260,
+        ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 4))
+
     @staticmethod
     def _find_default_calibration() -> Path | None:
         """Return the path to the default calibration file if it exists.
@@ -819,26 +839,6 @@ class FlimMasterApp(tk.Tk):
             return
         self.pixel_offset_path = path
         self._pixel_offset_label.config(text=Path(path).name, foreground="#333")
-
-        # ── 8-bin TDC clock pattern correction (self-calibrating) ────────────────
-        f_bp = ttk.LabelFrame(parent, text="8-bin pattern correction")
-        f_bp.pack(fill="x", pady=(0, 8))
-
-        self.bin_pattern_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            f_bp, text="Apply 8-bin TDC clock pattern correction",
-            variable=self.bin_pattern_var,
-        ).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 0))
-        ttk.Label(
-            f_bp,
-            text="Removes the ~10–15% per-bin sensitivity oscillation caused by "
-                 "the TDC clock cycle. Self-calibrating: the 8 correction factors "
-                 "are measured from the sum histogram of each file automatically — "
-                 "no separate calibration file needed. Apply before pixel-offset "
-                 "correction and spatial binning. Phase varies per session so "
-                 "cannot be pre-calibrated.",
-            foreground="#777", font=("", 8), wraplength=260,
-        ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 4))
 
     def _update_irf_window_end_state(self):
         self.irf_window_end_entry.config(state="normal" if self.irf_full_var.get() else "disabled")
