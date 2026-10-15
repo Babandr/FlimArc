@@ -16,20 +16,28 @@ button of its own -- it already knows which file it's looking at), and its
 own spatial binning is independent of whatever binning the main window's
 Masking settings are currently set to (so you can inspect at a different
 granularity than an actual analysis run would use).
+
+The decay panel is now a DecayPlotPanel (a CurveViewerWidget subclass),
+which provides the matplotlib figure, log/linear toggle, mouse-position
+readout, and CSV export button.  DecayViewer only handles data wrangling,
+pixel selection, and the image panel.
 """
 
-import csv
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 from analyses._common import build_group_cube
+from gui.curve_viewer_widget import CurveViewerWidget
 
+
+# ---------------------------------------------------------------------------
+# Data helpers (unchanged from original)
+# ---------------------------------------------------------------------------
 
 def _build_viewer_data(loaded_data, file_type):
     """Adapt the main window's already-loaded data -- a raw photon-stream
@@ -121,6 +129,57 @@ def pixel_decay_block(s, xb, yb, bin_size, t0_ms=None, t1_ms=None):
     return tn, hist, n
 
 
+# ---------------------------------------------------------------------------
+# Decay panel -- CurveViewerWidget subclass
+# ---------------------------------------------------------------------------
+
+class DecayPlotPanel(CurveViewerWidget):
+    """
+    FLIM-specific decay panel.
+
+    The controller (DecayViewer) sets the public data attributes then calls
+    refresh().  DecayPlotPanel never touches the file or the pixel selection
+    logic -- that stays in DecayViewer._draw_decay().
+
+    Attributes set by the controller before refresh()
+    --------------------------------------------------
+    t_ns : np.ndarray | None        nanosecond time axis
+    curves : list[tuple]            [(label, counts_array), ...] in plot order
+    windows_active : bool           True if time-window comparison is active
+    """
+
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(
+            parent,
+            title="Select a pixel",
+            x_label="Time",  y_label="Photon counts",
+            x_unit="ns",     y_unit="",
+            log_y=True,
+            figsize=(6, 5),
+        )
+        self.t_ns: np.ndarray | None = None
+        self.curves: list[tuple[str, np.ndarray]] = []
+
+    def refresh(self) -> None:
+        """Called by DecayViewer after updating t_ns / curves."""
+        self._refresh_plot()
+
+    def _refresh_plot(self) -> None:
+        self.clear()
+        if self.t_ns is None or not self.curves:
+            self.finalize(show_legend=False)
+            return
+
+        for label, hist in self.curves:
+            self.add_curve(self.t_ns, hist, label=label)
+
+        self.finalize()
+
+
+# ---------------------------------------------------------------------------
+# Main viewer window
+# ---------------------------------------------------------------------------
+
 class DecayViewer(tk.Toplevel):
     def __init__(self, master, loaded_data, file_type, filename):
         super().__init__(master)
@@ -129,18 +188,21 @@ class DecayViewer(tk.Toplevel):
         self.s = _build_viewer_data(loaded_data, file_type)
         self.selected_pixel = None    # (xb, yb) BLOCK indices of the currently selected super-pixel
         self.show_whole_image = False # True -> decay panel shows the whole-sensor pooled sum instead
-        self.windows = []             # list of (t0_ms, t1_ms, color) comparison windows
+        self.windows = []             # list of (t0_ms, t1_ms) comparison windows
         self.bin_size = 1             # current spatial binning factor (1 = no binning)
         self._binned_img = None       # img after binning, what's actually displayed
         self._Hb = self._Wb = None    # shape of the binned image (block-index bounds)
-        self._current_decay_tn = None      # ns time axis for whatever's currently plotted
-        self._current_decay_curves = []    # [(label, counts_array), ...] currently plotted
         self._build_ui(filename)
         self._recompute_binned_view()
 
-    # -- layout -------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Layout
+    # -----------------------------------------------------------------------
+
     def _build_ui(self, filename):
-        top = ttk.Frame(self); top.pack(side="top", fill="x", padx=8, pady=6)
+        # -- top bar: file info + binning controls --
+        top = ttk.Frame(self)
+        top.pack(side="top", fill="x", padx=8, pady=6)
         kind = "raw photon-stream" if self.s["time_resolved"] else "pre-computed histogram (no time windows)"
         ttk.Label(top, text=f"{filename}   [{kind}]", foreground="#333").pack(side="left")
 
@@ -151,10 +213,12 @@ class DecayViewer(tk.Toplevel):
         ttk.Button(top, text="Show whole-image sum", command=self.show_whole_image_sum).pack(
             side="left", padx=(0, 12))
 
-        main = ttk.Frame(self); main.pack(fill="both", expand=True)
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True)
 
         # -- left: intensity image, clickable, with zoom/pan toolbar --
-        left = ttk.Frame(main); left.pack(side="left", fill="both", expand=True)
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="both", expand=True)
         ttk.Label(left, text="Tip: use the zoom tool below to zoom in before "
                               "clicking -- pixels are small and easy to miss.",
                   wraplength=460, foreground="#555").pack(fill="x", padx=4, pady=(4, 0))
@@ -165,21 +229,20 @@ class DecayViewer(tk.Toplevel):
         self.toolbar_img = NavigationToolbar2Tk(self.canvas_img, left)
         self.toolbar_img.update()
         self.canvas_img.mpl_connect("button_press_event", self.on_pixel_click)
-        self._img_im = None       # the imshow AxesImage, kept so colorbar can attach to it
-        self._colorbar = None     # scalebar for the intensity image
-        self._pixel_box = None    # Rectangle patch highlighting the selected pixel
+        self._img_im = None
+        self._colorbar = None
+        self._pixel_box = None
 
-        # -- right: decay plot + time-window controls + photon-count readout --
-        right = ttk.Frame(main); right.pack(side="left", fill="both", expand=True)
-        self.fig_decay = Figure(figsize=(6, 5))
-        self.ax_decay = self.fig_decay.add_subplot(111)
-        self.canvas_decay = FigureCanvasTkAgg(self.fig_decay, master=right)
-        self.canvas_decay.get_tk_widget().pack(fill="both", expand=True)
-        toolbar_decay = NavigationToolbar2Tk(self.canvas_decay, right)
-        toolbar_decay.update()
-        ttk.Button(right, text="Export decay as CSV...", command=self.export_decay_csv).pack(
-            side="top", anchor="w", padx=6, pady=(2, 0))
+        # -- right: DecayPlotPanel + time-window controls + photon-count readout --
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
 
+        # Decay panel (CurveViewerWidget subclass) -- replaces the old bare
+        # Figure + canvas + toolbar + Export button block.
+        self._decay_panel = DecayPlotPanel(right)
+        self._decay_panel.pack(fill="both", expand=True)
+
+        # Time-window comparison controls
         ctrl = ttk.LabelFrame(right, text="Compare time windows (ms)")
         ctrl.pack(fill="x", padx=6, pady=6)
         ttk.Label(ctrl, text="Start:").grid(row=0, column=0, padx=2)
@@ -197,8 +260,7 @@ class DecayViewer(tk.Toplevel):
         self.window_list = tk.Listbox(ctrl, height=4)
         self.window_list.grid(row=1, column=0, columnspan=6, sticky="ew", pady=4, padx=2)
 
-        # Live photon-count readout for the selected pixel, updated on every
-        # pixel click and every window add/clear.
+        # Photon-count readout for the selected pixel
         info = ttk.LabelFrame(right, text="Photon counts for selected pixel")
         info.pack(fill="x", padx=6, pady=(0, 6))
         self.info_text = tk.Text(info, height=6, wrap="word", state="disabled",
@@ -206,7 +268,10 @@ class DecayViewer(tk.Toplevel):
         self.info_text.pack(fill="x", padx=4, pady=4)
         self._update_info_text(None, None, [])
 
-    # -- actions --------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Actions
+    # -----------------------------------------------------------------------
+
     def apply_binning(self):
         """Re-bin the current view to a new NxN factor and redraw. Existing
         pixel selection and time windows are cleared since block indices
@@ -223,11 +288,109 @@ class DecayViewer(tk.Toplevel):
         self.selected_pixel = None
         self.show_whole_image = False
         self._recompute_binned_view()
-        self._current_decay_tn = None
-        self._current_decay_curves = []
-        self.ax_decay.clear()
-        self.canvas_decay.draw()
+        # Clear the decay panel
+        self._decay_panel.t_ns = None
+        self._decay_panel.curves = []
+        self._decay_panel.refresh()
         self._update_info_text(None, None, [])
+
+    def show_whole_image_sum(self):
+        """Show the decay pooled over the ENTIRE sensor instead of one
+        pixel/block -- independent of the current bin_size (summing
+        everything makes spatial binning moot) and of any pixel selection,
+        though the pixel selection itself is left alone so clicking back
+        into pixel mode doesn't lose it."""
+        self.show_whole_image = True
+        self._update_pixel_highlight()   # clears the red selection box (nothing to highlight)
+        self._draw_decay()
+
+    def add_window(self):
+        if not self.s["time_resolved"]:
+            messagebox.showwarning(
+                "Not available",
+                "This file has no per-photon timing (it's a pre-summed export), "
+                "so time-window comparison isn't possible -- only the raw "
+                "photon-stream format preserves per-photon timing."
+            )
+            return
+        try:
+            t0 = float(self.t0_var.get())
+            t1 = float(self.t1_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Start/End must be numbers (ms).")
+            return
+        if t1 <= t0:
+            messagebox.showerror("Invalid range", "End must be greater than Start.")
+            return
+
+        self.windows.append((t0, t1))
+        self.window_list.insert(tk.END, f"{t0:.0f}-{t1:.0f} ms")
+        # Colour the listbox entry to match what the panel will draw.
+        # _PALETTE is imported from curve_viewer_widget, index 0 = full range
+        # so window colours start at index 1.
+        from gui.curve_viewer_widget import _PALETTE
+        colour = _PALETTE[(len(self.windows)) % len(_PALETTE)]
+        self.window_list.itemconfig(tk.END, fg=colour)
+        self._draw_decay()
+
+    def clear_windows(self):
+        self.windows = []
+        self.window_list.delete(0, tk.END)
+        self._draw_decay()
+
+    # -----------------------------------------------------------------------
+    # Decay drawing  (data wrangling only; rendering delegated to panel)
+    # -----------------------------------------------------------------------
+
+    def _draw_decay(self):
+        """Compute the decay histogram(s) for the current selection and
+        hand them to DecayPlotPanel for rendering."""
+        if self.selected_pixel is None and not self.show_whole_image:
+            self._decay_panel.t_ns = None
+            self._decay_panel.curves = []
+            self._decay_panel.set_title("Select a pixel")
+            self._decay_panel.refresh()
+            self._update_info_text(None, None, [])
+            return
+
+        info_lines = []
+        curves = []
+
+        if self.show_whole_image:
+            decay_fn = lambda t0=None, t1=None: whole_image_decay(self.s, t0, t1)
+            title = "Whole image"
+            total_for_readout = float(self.s["img"].sum())
+            readout_pixel = None
+        else:
+            xb, yb = self.selected_pixel
+            b = self.bin_size
+            decay_fn = lambda t0=None, t1=None: pixel_decay_block(self.s, xb, yb, b, t0, t1)
+            title = f"Super-pixel block ({xb},{yb})" if b > 1 else f"Pixel ({xb},{yb})"
+            total_for_readout = self._binned_img[yb, xb]
+            readout_pixel = (xb, yb)
+
+        tn, hist, n = decay_fn()
+        curves.append((f"Full range (n={n})", hist))
+        info_lines.append(("Full acquisition", n))
+
+        if self.s["time_resolved"]:
+            for (t0, t1) in self.windows:
+                tn_w, hist_w, n_w = decay_fn(t0, t1)
+                curves.append((f"{t0:.0f}-{t1:.0f} ms (n={n_w})", hist_w))
+                info_lines.append((f"{t0:.0f}-{t1:.0f} ms window", n_w))
+        elif self.windows:
+            info_lines.append(("(time windows disabled for this file)", ""))
+
+        self._decay_panel.t_ns = tn
+        self._decay_panel.curves = curves
+        self._decay_panel.set_title(f"{title} decay")
+        self._decay_panel.refresh()
+
+        self._update_info_text(readout_pixel, total_for_readout, info_lines)
+
+    # -----------------------------------------------------------------------
+    # Image panel (unchanged from original)
+    # -----------------------------------------------------------------------
 
     def _recompute_binned_view(self):
         """Rebuild the binned intensity image for the current bin_size and
@@ -257,16 +420,6 @@ class DecayViewer(tk.Toplevel):
 
         img = self._binned_img
         vmax = np.percentile(img, 99) if img.max() > 0 else 1
-        # interpolation="nearest" is important on a small sensor: the default
-        # smoothing blurs single bright pixels into a bigger-looking blob,
-        # making it easy to click 1 pixel/block off from the actual peak.
-        # aspect=2: Flimera's physical pixels are rectangular (roughly 2:1,
-        # wide:tall on the sensor) -- but this image is rotated 90 degrees
-        # for display, which swaps that ratio in what's actually shown
-        # here, so pixels need to render TALLER than wide (1:2,
-        # horizontal:vertical) to look physically correct rather than
-        # square. This stays correct at any bin_size, since binning uses
-        # the same NxN factor on both axes.
         self._img_im = self.ax_img.imshow(img, cmap="viridis", vmax=vmax,
                                            interpolation="nearest", aspect=2)
         self.ax_img.set_title(f"Click a super-pixel to see its decay{note}")
@@ -310,138 +463,9 @@ class DecayViewer(tk.Toplevel):
         self._update_pixel_highlight()
         self._draw_decay()
 
-    def show_whole_image_sum(self):
-        """Show the decay pooled over the ENTIRE sensor instead of one
-        pixel/block -- independent of the current bin_size (summing
-        everything makes spatial binning moot) and of any pixel selection,
-        though the pixel selection itself is left alone so clicking back
-        into pixel mode doesn't lose it."""
-        self.show_whole_image = True
-        self._update_pixel_highlight()   # clears the red selection box (nothing to highlight)
-        self._draw_decay()
-
-    def add_window(self):
-        if not self.s["time_resolved"]:
-            messagebox.showwarning(
-                "Not available",
-                "This file has no per-photon timing (it's a pre-summed export), "
-                "so time-window comparison isn't possible -- only the raw "
-                "photon-stream format preserves per-photon timing."
-            )
-            return
-        try:
-            t0 = float(self.t0_var.get())
-            t1 = float(self.t1_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid input", "Start/End must be numbers (ms).")
-            return
-        if t1 <= t0:
-            messagebox.showerror("Invalid range", "End must be greater than Start.")
-            return
-
-        color = plt.rcParams["axes.prop_cycle"].by_key()["color"][len(self.windows) % 10]
-        self.windows.append((t0, t1, color))
-        self.window_list.insert(tk.END, f"{t0:.0f}-{t1:.0f} ms")
-        self.window_list.itemconfig(tk.END, fg=color)
-        self._draw_decay()
-
-    def clear_windows(self):
-        self.windows = []
-        self.window_list.delete(0, tk.END)
-        self._draw_decay()
-
-    def _draw_decay(self):
-        self.ax_decay.clear()
-        if self.selected_pixel is None and not self.show_whole_image:
-            self._current_decay_tn = None
-            self._current_decay_curves = []
-            self.canvas_decay.draw()
-            self._update_info_text(None, None, [])
-            return
-
-        info_lines = []  # (label, count) pairs for the readout panel below
-        curves = []       # (label, counts_array) pairs, mirrors what's plotted -- for CSV export
-
-        if self.show_whole_image:
-            decay_fn = lambda t0=None, t1=None: whole_image_decay(self.s, t0, t1)
-            title = "Whole image"
-            total_for_readout = float(self.s["img"].sum())
-            readout_pixel = None
-        else:
-            xb, yb = self.selected_pixel
-            b = self.bin_size
-            decay_fn = lambda t0=None, t1=None: pixel_decay_block(self.s, xb, yb, b, t0, t1)
-            title = f"Super-pixel block ({xb},{yb})" if b > 1 else f"Pixel ({xb},{yb})"
-            total_for_readout = self._binned_img[yb, xb]
-            readout_pixel = (xb, yb)
-
-        if self.s["time_resolved"]:
-            tn, hist, n = decay_fn()
-            self.ax_decay.semilogy(tn, hist + 1, color="black", lw=1.2,
-                                    label=f"Full range (n={n})")
-            info_lines.append(("Full acquisition", n))
-            curves.append(("full_range", hist))
-            for (t0, t1, color) in self.windows:
-                tn_w, hist_w, n_w = decay_fn(t0, t1)
-                self.ax_decay.semilogy(tn_w, hist_w + 1, color=color, lw=1.5,
-                                        label=f"{t0:.0f}-{t1:.0f} ms (n={n_w})")
-                info_lines.append((f"{t0:.0f}-{t1:.0f} ms window", n_w))
-                curves.append((f"{t0:.0f}-{t1:.0f}_ms", hist_w))
-        else:
-            tn, hist, n = decay_fn()
-            self.ax_decay.semilogy(tn, hist + 1, color="black", lw=1.2,
-                                    label=f"Full range (n={n})")
-            info_lines.append(("Full acquisition", n))
-            curves.append(("full_range", hist))
-            if self.windows:
-                info_lines.append(("(time windows disabled for this file)", ""))
-
-        self._current_decay_tn = tn
-        self._current_decay_curves = curves
-
-        self.ax_decay.set_xlabel("Time (ns)")
-        self.ax_decay.set_ylabel("Photon counts")
-        self.ax_decay.set_title(f"{title} decay")
-        self.ax_decay.legend(fontsize=8)
-        self.fig_decay.tight_layout()
-        self.canvas_decay.draw()
-
-        self._update_info_text(readout_pixel, total_for_readout, info_lines)
-
-    def export_decay_csv(self):
-        """Save exactly what's currently plotted in the decay panel -- the
-        full-range curve, plus any active time-window curves -- to a CSV.
-        All curves share the same nanosecond time axis (same fixed bin
-        range/count regardless of pixel or window), so this is one file
-        with one time_ns column and one counts column per curve, not
-        separate files."""
-        if (self.selected_pixel is None and not self.show_whole_image) or not self._current_decay_curves:
-            messagebox.showwarning("Nothing to export", "Click a pixel first to see a decay curve, "
-                                                         "or use \"Show whole-image sum\" above.")
-            return
-        if self.show_whole_image:
-            default_name = "whole_image_decay.csv"
-        else:
-            xb, yb = self.selected_pixel
-            default_name = f"pixel_{xb}_{yb}_decay.csv"
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile=default_name,
-        )
-        if not path:
-            return
-        try:
-            tn = self._current_decay_tn
-            with open(path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(["time_ns"] + [label for label, _ in self._current_decay_curves])
-                counts = [c for _, c in self._current_decay_curves]
-                for i in range(len(tn)):
-                    w.writerow([f"{tn[i]:.6f}"] + [int(c[i]) for c in counts])
-            messagebox.showinfo("Saved", f"Decay data saved to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Save error", str(e))
+    # -----------------------------------------------------------------------
+    # Photon-count readout (unchanged from original)
+    # -----------------------------------------------------------------------
 
     def _update_info_text(self, pixel, total_from_image, info_lines):
         """Refresh the photon-count readout panel below the decay plot."""
