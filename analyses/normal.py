@@ -43,6 +43,7 @@ from flim_core.irf import (
     plot_irf_diagnostic,
 )
 from flim_core.pixel_offset import PixelOffsetCorrection
+from flim_core.bin_pattern import BinPatternCorrection
 from analyses._common import build_group_cube
 
 NAME = "Normal (pixel-wise)"
@@ -117,6 +118,20 @@ def process_file(h5file, args):
     report_dead_pixels(img)
 
     cube = build_decay_cube(s)
+
+    # 8-bin TDC clock pattern correction -- applied first, before pixel-offset
+    # correction and before any spatial or time binning.  The phase factors are
+    # measured self-calibratingly from the sum histogram of THIS file so no
+    # separate calibration step is needed.  Skipped when the checkbox is off.
+    bin_pattern_meta = "none"
+    if getattr(args, "bin_pattern", False):
+        print("\nApplying 8-bin pattern correction (self-calibrating from sum histogram) ...")
+        try:
+            bp = BinPatternCorrection.from_cube(cube, s["B0"])
+            cube = bp.apply(cube, s["B0"])
+            bin_pattern_meta = f"self-calibrated amplitude={bp.amplitude*100:.1f}%"
+        except Exception as exc:
+            print(f"  WARNING: 8-bin pattern correction failed ({exc}); continuing without it.")
 
     # Per-pixel SPAD timing offset correction -- applied before any spatial
     # binning or ROI crop so every downstream step sees aligned histograms.
@@ -336,7 +351,8 @@ def process_file(h5file, args):
                  n_photons_fit=fit["n_photons"], irf_shift=fit["shift"],
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
-                 pixel_offset_calibration=pixel_offset_meta)
+                 pixel_offset_calibration=pixel_offset_meta,
+                 bin_pattern_correction=bin_pattern_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -364,7 +380,8 @@ def process_file(h5file, args):
                  n_photons_fit=fit["n_photons"],
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
-                 pixel_offset_calibration=pixel_offset_meta)
+                 pixel_offset_calibration=pixel_offset_meta,
+                 bin_pattern_correction=bin_pattern_meta)
         print(f"  saved {prefix}_maps.npz")
         print(f"Done with {h5file}.")
         return
@@ -441,7 +458,8 @@ def process_file(h5file, args):
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size,
                  tau_global=g["tau"], tau_global_std=g.get("tau_std", np.nan), fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
-                 pixel_offset_calibration=pixel_offset_meta)
+                 pixel_offset_calibration=pixel_offset_meta,
+                 bin_pattern_correction=bin_pattern_meta)
     else:
         tau_long, tau_short = fit["tau_long"], fit["tau_short"]
         tlv = tau_long[np.isfinite(tau_long)]
@@ -466,7 +484,8 @@ def process_file(h5file, args):
                  tau_short_global_std=g.get("tau_short_std", np.nan),
                  tau_long_global_std=g.get("tau_long_std", np.nan), fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
-                 pixel_offset_calibration=pixel_offset_meta)
+                 pixel_offset_calibration=pixel_offset_meta,
+                 bin_pattern_correction=bin_pattern_meta)
     print(f"  saved {prefix}_maps.npz")
     print(f"Done with {h5file}.")
 

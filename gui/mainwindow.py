@@ -820,6 +820,26 @@ class FlimMasterApp(tk.Tk):
         self.pixel_offset_path = path
         self._pixel_offset_label.config(text=Path(path).name, foreground="#333")
 
+        # ── 8-bin TDC clock pattern correction (self-calibrating) ────────────────
+        f_bp = ttk.LabelFrame(parent, text="8-bin pattern correction")
+        f_bp.pack(fill="x", pady=(0, 8))
+
+        self.bin_pattern_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            f_bp, text="Apply 8-bin TDC clock pattern correction",
+            variable=self.bin_pattern_var,
+        ).grid(row=0, column=0, sticky="w", padx=4, pady=(4, 0))
+        ttk.Label(
+            f_bp,
+            text="Removes the ~10–15% per-bin sensitivity oscillation caused by "
+                 "the TDC clock cycle. Self-calibrating: the 8 correction factors "
+                 "are measured from the sum histogram of each file automatically — "
+                 "no separate calibration file needed. Apply before pixel-offset "
+                 "correction and spatial binning. Phase varies per session so "
+                 "cannot be pre-calibrated.",
+            foreground="#777", font=("", 8), wraplength=260,
+        ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 4))
+
     def _update_irf_window_end_state(self):
         self.irf_window_end_entry.config(state="normal" if self.irf_full_var.get() else "disabled")
 
@@ -1059,21 +1079,40 @@ class FlimMasterApp(tk.Tk):
             return
 
         viewer_data = self.loaded_data   # default: pass original reference
-        if (self.pixel_offset_var.get()
-                and self.pixel_offset_path
-                and self.file_type != "raw"):   # raw photon-stream files use per-photon
-                                                # arrival times, not a pre-built cube
-            try:
-                corr = PixelOffsetCorrection.load(self.pixel_offset_path)
-                corrected_cube = corr.apply(
-                    self.loaded_data["cube"], self.loaded_data["tpb"])
-                # Shallow copy: only replace the cube key, keep everything else
-                viewer_data = dict(self.loaded_data, cube=corrected_cube)
-                print(f"  [decay viewer] pixel offset correction applied "
-                      f"({Path(self.pixel_offset_path).name})")
-            except Exception as exc:
-                print(f"  [decay viewer] WARNING: pixel offset correction failed "
-                      f"({exc}); showing uncorrected decay.")
+        if self.file_type != "raw":      # raw photon-stream files use per-photon
+                                         # arrival times, not a pre-built cube
+            working_cube = self.loaded_data["cube"]
+            modified     = False
+
+            # 1. 8-bin pattern correction (self-calibrating, applied first)
+            if self.bin_pattern_var.get():
+                try:
+                    from flim_core.bin_pattern import BinPatternCorrection
+                    bp = BinPatternCorrection.from_cube(
+                        working_cube, self.loaded_data["B0"])
+                    working_cube = bp.apply(working_cube, self.loaded_data["B0"])
+                    modified = True
+                    print(f"  [decay viewer] 8-bin pattern correction applied "
+                          f"(amplitude {bp.amplitude*100:.1f}%)")
+                except Exception as exc:
+                    print(f"  [decay viewer] WARNING: 8-bin pattern correction failed "
+                          f"({exc}); showing uncorrected.")
+
+            # 2. Per-pixel offset correction
+            if self.pixel_offset_var.get() and self.pixel_offset_path:
+                try:
+                    corr = PixelOffsetCorrection.load(self.pixel_offset_path)
+                    working_cube = corr.apply(
+                        working_cube, self.loaded_data["tpb"])
+                    modified = True
+                    print(f"  [decay viewer] pixel offset correction applied "
+                          f"({Path(self.pixel_offset_path).name})")
+                except Exception as exc:
+                    print(f"  [decay viewer] WARNING: pixel offset correction failed "
+                          f"({exc}); showing uncorrected decay.")
+
+            if modified:
+                viewer_data = dict(self.loaded_data, cube=working_cube)
 
         self.decay_viewer_window = DecayViewer(
             self, viewer_data, self.file_type, Path(self.filepath).name)
@@ -1282,6 +1321,7 @@ class FlimMasterApp(tk.Tk):
             irf_window_end_ns=self.irf_window_end_ns_var.get(),
             pixel_offset_path=(self.pixel_offset_path
                                if self.pixel_offset_var.get() else None),
+            bin_pattern=self.bin_pattern_var.get(),
             selection_mode=selection_mode,
             roi_bounds=roi_bounds,
             external_mask_path=external_mask_path,
@@ -1324,6 +1364,7 @@ class FlimMasterApp(tk.Tk):
         ns.irf_full = settings["irf_full"]
         ns.irf_window_end_ns = settings["irf_window_end_ns"]
         ns.pixel_offset = settings["pixel_offset_path"]
+        ns.bin_pattern  = settings["bin_pattern"]
         ns.tau_short_bounds = settings["tau_short_bounds"]
         ns.tau_long_bounds = settings["tau_long_bounds"]
         ns.tau_mono_bounds = settings["tau_mono_bounds"]
