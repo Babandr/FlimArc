@@ -75,6 +75,20 @@ def bin_image(img, bin_size):
     return binned, (Hc, Wc)
 
 
+def moving_avg_image(img, window):
+    """Apply a spatial moving average with a square window of size window×window
+    to the intensity image, using a uniform (box) filter.  Unlike block binning
+    this keeps the output at full spatial resolution so every pixel in the
+    displayed image represents the pooled photons from its neighbourhood.
+    Returns the smoothed image (same shape as input) plus the original (H, W)
+    as the crop shape (no cropping needed here, unlike block binning)."""
+    from scipy.ndimage import uniform_filter
+    if window <= 1:
+        return img, img.shape
+    smoothed = uniform_filter(img.astype(float), size=window, mode="nearest")
+    return smoothed, img.shape
+
+
 def whole_image_decay(s, t0_ms=None, t1_ms=None):
     """Decay histogram pooled over EVERY pixel in the sensor (not just one
     binned block) -- the whole-image equivalent of pixel_decay_block.
@@ -189,7 +203,9 @@ class DecayViewer(tk.Toplevel):
         self.selected_pixel = None    # (xb, yb) BLOCK indices of the currently selected super-pixel
         self.show_whole_image = False # True -> decay panel shows the whole-sensor pooled sum instead
         self.windows = []             # list of (t0_ms, t1_ms) comparison windows
-        self.bin_size = 1             # current spatial binning factor (1 = no binning)
+        self.bin_size = 1             # current spatial block-binning factor (1 = no binning)
+        self.moving_avg = 1          # current moving-average window (1 = off)
+        self.time_bin = 1            # current time-binning factor (1 = no binning)
         self._binned_img = None       # img after binning, what's actually displayed
         self._Hb = self._Wb = None    # shape of the binned image (block-index bounds)
         self._build_ui(filename)
@@ -206,10 +222,24 @@ class DecayViewer(tk.Toplevel):
         kind = "raw photon-stream" if self.s["time_resolved"] else "pre-computed histogram (no time windows)"
         ttk.Label(top, text=f"{filename}   [{kind}]", foreground="#333").pack(side="left")
 
-        ttk.Label(top, text="   Bin (NxN):").pack(side="left")
+        # Spatial binning
+        ttk.Label(top, text="   Spatial bin (NxN):").pack(side="left")
         self.bin_var = tk.StringVar(value="1")
         ttk.Spinbox(top, from_=1, to=20, width=4, textvariable=self.bin_var).pack(side="left")
-        ttk.Button(top, text="Apply binning", command=self.apply_binning).pack(side="left", padx=(4, 12))
+        ttk.Button(top, text="Apply", command=self.apply_binning).pack(side="left", padx=(4, 12))
+
+        # Moving average (spatial)
+        ttk.Label(top, text="Moving avg (NxN):").pack(side="left")
+        self.moving_avg_var = tk.StringVar(value="1")
+        ttk.Spinbox(top, from_=1, to=20, width=4, textvariable=self.moving_avg_var).pack(side="left")
+        ttk.Button(top, text="Apply", command=self.apply_moving_avg).pack(side="left", padx=(4, 12))
+
+        # Time binning
+        ttk.Label(top, text="Time bin (N):").pack(side="left")
+        self.time_bin_var = tk.StringVar(value="1")
+        ttk.Spinbox(top, from_=1, to=64, width=4, textvariable=self.time_bin_var).pack(side="left")
+        ttk.Button(top, text="Apply", command=self.apply_time_bin).pack(side="left", padx=(4, 12))
+
         ttk.Button(top, text="Show whole-image sum", command=self.show_whole_image_sum).pack(
             side="left", padx=(0, 12))
 
@@ -285,6 +315,10 @@ class DecayViewer(tk.Toplevel):
             messagebox.showerror("Invalid input", "Bin size must be at least 1.")
             return
         self.bin_size = n
+        if n > 1:
+            # Reset moving average -- the two modes are mutually exclusive
+            self.moving_avg = 1
+            self.moving_avg_var.set("1")
         self.selected_pixel = None
         self.show_whole_image = False
         self._recompute_binned_view()
@@ -293,6 +327,47 @@ class DecayViewer(tk.Toplevel):
         self._decay_panel.curves = []
         self._decay_panel.refresh()
         self._update_info_text(None, None, [])
+
+    def apply_moving_avg(self):
+        """Switch to moving-average mode with the requested window size.
+        Moving average and block binning are mutually exclusive -- switching
+        to moving average resets block binning to 1 and vice-versa, matching
+        the main-window behaviour documented in masking.moving_average_cube."""
+        try:
+            n = int(self.moving_avg_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Moving average window must be a whole number.")
+            return
+        if n < 1:
+            messagebox.showerror("Invalid input", "Moving average window must be at least 1.")
+            return
+        self.moving_avg = n
+        if n > 1:
+            # Reset block binning -- the two modes are mutually exclusive
+            self.bin_size = 1
+            self.bin_var.set("1")
+        self.selected_pixel = None
+        self.show_whole_image = False
+        self._recompute_binned_view()
+        self._decay_panel.t_ns = None
+        self._decay_panel.curves = []
+        self._decay_panel.refresh()
+        self._update_info_text(None, None, [])
+
+    def apply_time_bin(self):
+        """Apply (or remove) time-axis binning.  Does not reset pixel
+        selection or spatial binning -- time binning is orthogonal to both
+        and takes effect immediately on the currently displayed decay."""
+        try:
+            n = int(self.time_bin_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Time bin must be a whole number.")
+            return
+        if n < 1:
+            messagebox.showerror("Invalid input", "Time bin must be at least 1.")
+            return
+        self.time_bin = n
+        self._draw_decay()   # redraw with new time binning, no pixel reset needed
 
     def show_whole_image_sum(self):
         """Show the decay pooled over the ENTIRE sensor instead of one
@@ -361,6 +436,29 @@ class DecayViewer(tk.Toplevel):
             title = "Whole image"
             total_for_readout = float(self.s["img"].sum())
             readout_pixel = None
+        elif self.moving_avg > 1 and not self.s["time_resolved"]:
+            # Moving-average mode for histogram files: pool the decay from the
+            # neighbourhood around (xb, yb) using a moving_avg × moving_avg window
+            # centred on that pixel (clamped to image edges).
+            xb, yb = self.selected_pixel
+            ma = self.moving_avg
+            H, W = self.s["H"], self.s["W"]
+            x0 = max(0, xb - ma // 2); x1 = min(W, x0 + ma)
+            y0 = max(0, yb - ma // 2); y1 = min(H, y0 + ma)
+            # Reuse pixel_decay_block with a block large enough to cover the window
+            # by temporarily faking a block that covers exactly [x0:x1, y0:y1].
+            # Simpler: sum the cube slice directly.
+            hist_ma = self.s["cube"][y0:y1, x0:x1, :].astype(float).sum(axis=(0, 1))
+            n_ma    = int(hist_ma.sum())
+            tn_ma   = np.arange(self.s["nb"]) * self.s["tpb"] * 1e9
+            decay_fn = None   # signal that we already have the histogram
+            hist_full, n_full = hist_ma, n_ma
+            tn_full = tn_ma
+            n_px = (x1 - x0) * (y1 - y0)
+            title = (f"Pixel ({xb},{yb}) + {ma}×{ma} moving avg "
+                     f"[{n_px} px pooled]")
+            total_for_readout = self._binned_img[yb, xb]
+            readout_pixel = (xb, yb)
         else:
             xb, yb = self.selected_pixel
             b = self.bin_size
@@ -369,19 +467,38 @@ class DecayViewer(tk.Toplevel):
             total_for_readout = self._binned_img[yb, xb]
             readout_pixel = (xb, yb)
 
-        tn, hist, n = decay_fn()
-        curves.append((f"Full range (n={n})", hist))
-        info_lines.append(("Full acquisition", n))
+        # Fetch the full-range decay (skip if moving-average already computed it)
+        if decay_fn is not None:
+            tn_full, hist_full, n_full = decay_fn()
 
-        if self.s["time_resolved"]:
+        # Apply time binning to the histogram and time axis.
+        # Groups every time_bin adjacent channels into one by summing.
+        # tpb of the displayed curve = original tpb × time_bin.
+        def apply_time_bin(tn, hist):
+            tb = self.time_bin
+            if tb <= 1:
+                return tn, hist
+            nb = len(hist)
+            nb_trunc = (nb // tb) * tb
+            hist_binned = hist[:nb_trunc].reshape(-1, tb).sum(axis=1)
+            tn_binned   = tn[:nb_trunc].reshape(-1, tb).mean(axis=1)
+            return tn_binned, hist_binned
+
+        tn_full, hist_full = apply_time_bin(tn_full, hist_full)
+        tb_label = f", t-bin×{self.time_bin}" if self.time_bin > 1 else ""
+        curves.append((f"Full range (n={n_full}){tb_label}", hist_full))
+        info_lines.append(("Full acquisition", n_full))
+
+        if self.s["time_resolved"] and decay_fn is not None:
             for (t0, t1) in self.windows:
                 tn_w, hist_w, n_w = decay_fn(t0, t1)
-                curves.append((f"{t0:.0f}-{t1:.0f} ms (n={n_w})", hist_w))
+                tn_w, hist_w = apply_time_bin(tn_w, hist_w)
+                curves.append((f"{t0:.0f}-{t1:.0f} ms (n={n_w}){tb_label}", hist_w))
                 info_lines.append((f"{t0:.0f}-{t1:.0f} ms window", n_w))
         elif self.windows:
             info_lines.append(("(time windows disabled for this file)", ""))
 
-        self._decay_panel.t_ns = tn
+        self._decay_panel.t_ns = tn_full
         self._decay_panel.curves = curves
         self._decay_panel.set_title(f"{title} decay")
         self._decay_panel.refresh()
@@ -393,18 +510,28 @@ class DecayViewer(tk.Toplevel):
     # -----------------------------------------------------------------------
 
     def _recompute_binned_view(self):
-        """Rebuild the binned intensity image for the current bin_size and
-        redraw the image panel from scratch."""
-        self._binned_img, (Hc, Wc) = bin_image(self.s["img"], self.bin_size)
-        self._Hb, self._Wb = self._binned_img.shape
-        if self.bin_size > 1:
-            dropped_h, dropped_w = self.s["H"] - Hc, self.s["W"] - Wc
-            note = f" (bin {self.bin_size}x{self.bin_size}"
-            if dropped_h or dropped_w:
-                note += f", cropped {dropped_h} row(s)/{dropped_w} col(s) at the edge to fit"
-            note += ")"
+        """Rebuild the intensity image for the current spatial mode and
+        redraw the image panel from scratch.  Handles three cases:
+        no binning (1×1), block binning (bin_size > 1), and moving average
+        (moving_avg > 1).  The two spatial modes are mutually exclusive."""
+        if self.moving_avg > 1:
+            self._binned_img, (Hc, Wc) = moving_avg_image(
+                self.s["img"], self.moving_avg)
+            self._Hb, self._Wb = self._binned_img.shape
+            note = f" (moving avg {self.moving_avg}×{self.moving_avg})"
         else:
-            note = ""
+            self._binned_img, (Hc, Wc) = bin_image(self.s["img"], self.bin_size)
+            self._Hb, self._Wb = self._binned_img.shape
+            if self.bin_size > 1:
+                dropped_h = self.s["H"] - Hc
+                dropped_w = self.s["W"] - Wc
+                note = f" (bin {self.bin_size}×{self.bin_size}"
+                if dropped_h or dropped_w:
+                    note += (f", cropped {dropped_h} row(s)/"
+                             f"{dropped_w} col(s) at edge to fit")
+                note += ")"
+            else:
+                note = ""
         self._draw_image_base(note)
 
     def _draw_image_base(self, note=""):
