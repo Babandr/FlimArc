@@ -341,7 +341,7 @@ def process_file(h5file, args):
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, fit["tau_mean"], threshold, min_neighbors,
                         f"{prefix}_results.png", show, bin_size=plot_bin_size,
-                        label="tau_mean_irf", symbol="\u27e8t\u27e9")
+                        label="tau_mean_irf", symbol="\u27e8t\u27e9", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_mean_std"], fit["n_photons"], mask, f"{prefix}_quality.png", show,
                              symbol="\u27e8t\u27e9")
@@ -370,7 +370,7 @@ def process_file(h5file, args):
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, fit["tau_mean"], threshold, min_neighbors,
                         f"{prefix}_results.png", show, bin_size=plot_bin_size,
-                        label="tau_mean", symbol="\u27e8t\u27e9")
+                        label="tau_mean", symbol="\u27e8t\u27e9", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_mean_std"], fit["n_photons"], mask, f"{prefix}_quality.png", show,
                              symbol="\u27e8t\u27e9")
@@ -447,7 +447,7 @@ def process_file(h5file, args):
             print(f"  tau_std: median {np.median(std_v):.3f} ns")
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, tau_map, threshold, min_neighbors,
-                         f"{prefix}_results.png", show, bin_size=plot_bin_size, label="tau", symbol="\u03c4")
+                         f"{prefix}_results.png", show, bin_size=plot_bin_size, label="tau", symbol="\u03c4", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_std"], fit["n_photons"], mask, f"{prefix}_quality.png", show,
                              symbol="\u03c4", converged_map=fit["converged"])
@@ -470,7 +470,7 @@ def process_file(h5file, args):
             print(f"  tau_long_std: median {np.median(std_v):.3f} ns")
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, tau_long, threshold, min_neighbors,
-                         f"{prefix}_results.png", show, bin_size=plot_bin_size)
+                         f"{prefix}_results.png", show, bin_size=plot_bin_size, vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_long_std"], fit["n_photons"], mask, f"{prefix}_quality.png", show,
                              symbol="\u03c4_long", converged_map=fit["converged"])
