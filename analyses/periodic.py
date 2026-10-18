@@ -251,22 +251,6 @@ def run(args):
     if roi is not None:
         d, roi = crop_photon_data(d, roi)
 
-    # Per-photon SPAD timing offset correction -- applied once here,
-    # before any build_group_cube call, so every time window / phase
-    # group built afterward automatically contains corrected histograms.
-    # Skipped when args.pixel_offset is None (checkbox unchecked).
-    _offset_path = getattr(args, "pixel_offset", None)
-    if _offset_path:
-        print(f"\nApplying photon-level pixel offset correction "
-              f"from {Path(_offset_path).name} ...")
-        try:
-            import numpy as _np
-            _omap = _np.load(_offset_path)
-            d = apply_offset_to_photons(d, _omap, d["tpb"])
-        except Exception as _exc:
-            print(f"  WARNING: photon offset correction failed ({_exc}); "
-                  f"continuing without it.")
-
     period_s = args.period
     if period_s is None:
         resp = input("Period of the repeating change, in seconds [1.0]: ").strip()
