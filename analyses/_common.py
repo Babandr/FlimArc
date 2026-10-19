@@ -255,6 +255,68 @@ def crop_photon_data(d, roi):
     return d2, (x0, y0, x1, y1)
 
 
+def apply_offset_to_photons(d: dict, offset_map, tpb: float) -> dict:
+    """Shift each photon's microtime bin by its pixel's timing offset.
+
+    Raw-photon-stream equivalent of PixelOffsetCorrection.apply() for
+    pre-computed histogram cubes.  Applied once to the photon list so every
+    subsequent build_group_cube() call -- for every time window or phase
+    group -- automatically produces corrected histograms.
+
+    The offset is rounded to the nearest integer bin (precision ±0.5 bin =
+    ±19 ps at 37.4 ps/bin -- smaller than the calibration noise floor of
+    7.7 ps rms and the bin width itself).  Photons shifted outside [B0, B1]
+    are dropped, identical in effect to FFT-circular-shift edge behaviour
+    for histogram cubes.
+
+    Parameters
+    ----------
+    d          : dict from load_raw_with_time (x, y, micro, time_ms, …)
+    offset_map : (H, W) float array, offsets in ps, NaN = no calibration
+    tpb        : seconds per bin (d["tpb"])
+
+    Returns a shallow copy of d with corrected micro, updated n_photons.
+    """
+    import numpy as np
+
+    H, W = d["H"], d["W"]
+    if offset_map.shape != (H, W):
+        raise ValueError(
+            f"Offset map shape {offset_map.shape} does not match sensor "
+            f"({H}, {W}).  Check the calibration file matches this camera."
+        )
+
+    tpb_ps = tpb * 1e12
+    shift_map = np.zeros((H, W), dtype=np.int32)
+    valid = np.isfinite(offset_map)
+    shift_map[valid] = np.round(-offset_map[valid] / tpb_ps).astype(np.int32)
+
+    n_nan = int((~valid).sum())
+    if n_nan:
+        print(f"  [photon offset] {n_nan} pixels have no calibration "
+              f"(NaN) -- their photons are left uncorrected.")
+
+    micro_shifted = d["micro"].astype(np.int32) + shift_map[d["y"], d["x"]]
+
+    B0, B1 = d["B0"], d["B1"]
+    keep = (micro_shifted >= B0) & (micro_shifted <= B1)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f"  [photon offset] {n_dropped} / {len(micro_shifted)} photons "
+              f"({n_dropped/len(micro_shifted)*100:.2f}%) dropped -- "
+              f"shifted outside [{B0}, {B1}] window edges.")
+
+    d2 = dict(d)
+    d2["x"]        = d["x"][keep]
+    d2["y"]        = d["y"][keep]
+    d2["micro"]    = micro_shifted[keep].astype(d["micro"].dtype)
+    d2["time_ms"]  = d["time_ms"][keep]
+    d2["n_photons"] = int(keep.sum())
+    print(f"  [photon offset] applied to {int(valid.sum())} / {H*W} pixels "
+          f"| {d2['n_photons']:,} photons remain")
+    return d2
+
+
 def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_neighbors, phase_desc,
                   irf_aligned=None, external_mask=None):
     """Run the mask -> fit -> plot -> save pipeline for one phase group's
@@ -369,7 +431,7 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, fit["tau_mean"], threshold, min_neighbors,
                          f"{gprefix}_results.png", not args.no_show, bin_size=args.bin,
-                         label="tau_mean_irf", symbol="\u27e8t\u27e9")
+                         label="tau_mean_irf", symbol="\u27e8t\u27e9", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_mean_std"], fit["n_photons"], mask, f"{gprefix}_quality.png",
                              not args.no_show, symbol="\u27e8t\u27e9")
@@ -397,7 +459,7 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, fit["tau_mean"], threshold, min_neighbors,
                          f"{gprefix}_results.png", not args.no_show, bin_size=args.bin,
-                         label="tau_mean", symbol="\u27e8t\u27e9")
+                         label="tau_mean", symbol="\u27e8t\u27e9", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_mean_std"], fit["n_photons"], mask, f"{gprefix}_quality.png",
                              not args.no_show, symbol="\u27e8t\u27e9")
@@ -448,7 +510,7 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, tau_map, threshold, min_neighbors,
                          f"{gprefix}_results.png", not args.no_show, bin_size=args.bin,
-                         label="tau", symbol="\u03c4")
+                         label="tau", symbol="\u03c4", vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_std"], fit["n_photons"], mask, f"{gprefix}_quality.png",
                              not args.no_show, symbol="\u03c4", converged_map=fit["converged"])
@@ -475,7 +537,7 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
                          f"{gprefix}_results.png", not args.no_show, bin_size=args.bin)
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_long_std"], fit["n_photons"], mask, f"{gprefix}_quality.png",
-                             not args.no_show, symbol="\u03c4_long", converged_map=fit["converged"])
+                             not args.no_show, symbol="\u03c4_long", converged_map=fit["converged"], vlim=getattr(args, "lifetime_vlim", None))
         np.savez(f"{gprefix}_maps.npz",
                  photons_per_pixel=img, mask=mask, removed_isolated=removed,
                  tau_long_ns=tau_long, tau_short_ns=tau_short,

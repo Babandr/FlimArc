@@ -794,6 +794,44 @@ class FlimMasterApp(tk.Tk):
             foreground="#777", font=("", 8), wraplength=260,
         ).grid(row=1, column=0, sticky="w", padx=4, pady=(0, 4))
 
+        # ── Lifetime display range ────────────────────────────────────────────────
+        f_lr = ttk.LabelFrame(parent, text="Lifetime display range")
+        f_lr.pack(fill="x", pady=(0, 8))
+
+        self.lifetime_range_auto_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            f_lr, text="Auto (1st–99th percentile of each map)",
+            variable=self.lifetime_range_auto_var,
+            command=self._update_lifetime_range_state,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 2))
+        ttk.Label(
+            f_lr,
+            text="Manual range fixes the colour scale across all output maps "
+                 "(frames, groups, files) so they can be compared directly. "
+                 "Auto scales each map independently to its own data.",
+            foreground="#777", font=("", 8), wraplength=260,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=4)
+
+        self._lr_min_label = ttk.Label(f_lr, text="Min (ns):")
+        self._lr_min_label.grid(row=2, column=0, sticky="w", padx=(4, 2), pady=(6, 4))
+        self.lifetime_range_min_var = tk.DoubleVar(value=0.0)
+        self._lr_min_entry = ttk.Entry(f_lr, textvariable=self.lifetime_range_min_var, width=7)
+        self._lr_min_entry.grid(row=2, column=1, padx=(0, 8), pady=(6, 4))
+
+        self._lr_max_label = ttk.Label(f_lr, text="Max (ns):")
+        self._lr_max_label.grid(row=2, column=2, sticky="w", padx=(0, 2), pady=(6, 4))
+        self.lifetime_range_max_var = tk.DoubleVar(value=5.0)
+        self._lr_max_entry = ttk.Entry(f_lr, textvariable=self.lifetime_range_max_var, width=7)
+        self._lr_max_entry.grid(row=2, column=3, padx=(0, 4), pady=(6, 4))
+
+        self._update_lifetime_range_state()
+
+    def _update_lifetime_range_state(self):
+        state = "disabled" if self.lifetime_range_auto_var.get() else "normal"
+        for w in (self._lr_min_label, self._lr_min_entry,
+                  self._lr_max_label, self._lr_max_entry):
+            w.config(state=state)
+
     @staticmethod
     def _find_default_calibration() -> Path | None:
         """Return the path to the default calibration file if it exists.
@@ -1322,6 +1360,9 @@ class FlimMasterApp(tk.Tk):
             pixel_offset_path=(self.pixel_offset_path
                                if self.pixel_offset_var.get() else None),
             bin_pattern=self.bin_pattern_var.get(),
+            lifetime_vlim=(None if self.lifetime_range_auto_var.get()
+                           else (self.lifetime_range_min_var.get(),
+                                 self.lifetime_range_max_var.get())),
             selection_mode=selection_mode,
             roi_bounds=roi_bounds,
             external_mask_path=external_mask_path,
@@ -1363,8 +1404,9 @@ class FlimMasterApp(tk.Tk):
         ns.no_shift = settings["no_shift"]
         ns.irf_full = settings["irf_full"]
         ns.irf_window_end_ns = settings["irf_window_end_ns"]
-        ns.pixel_offset = settings["pixel_offset_path"]
-        ns.bin_pattern  = settings["bin_pattern"]
+        ns.pixel_offset  = settings["pixel_offset_path"]
+        ns.bin_pattern   = settings["bin_pattern"]
+        ns.lifetime_vlim = settings["lifetime_vlim"]
         ns.tau_short_bounds = settings["tau_short_bounds"]
         ns.tau_long_bounds = settings["tau_long_bounds"]
         ns.tau_mono_bounds = settings["tau_mono_bounds"]

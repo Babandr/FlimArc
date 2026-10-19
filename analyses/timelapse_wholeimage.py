@@ -32,7 +32,7 @@ from flim_core.irf import (
 from analyses._common import (
     window_boundaries,
     apply_spatial_and_time_binning,
-    load_raw_with_time, build_group_cube, crop_photon_data,
+    load_raw_with_time, build_group_cube, crop_photon_data, apply_offset_to_photons,
     fit_window_sum, fit_window_sum_reconv, fit_window_sum_mean_arrival,
     fit_window_sum_mean_arrival_reconv,
     plot_window_fit, plot_window_fit_reconv, plot_pooled_mean_arrival,
@@ -229,6 +229,22 @@ def run(args):
         roi = prompt_roi(d["W"], d["H"])
     if roi is not None:
         d, roi = crop_photon_data(d, roi)
+
+    # Per-photon SPAD timing offset correction -- applied once here,
+    # before any build_group_cube call, so every time window / phase
+    # group built afterward automatically contains corrected histograms.
+    # Skipped when args.pixel_offset is None (checkbox unchecked).
+    _offset_path = getattr(args, "pixel_offset", None)
+    if _offset_path:
+        print(f"\nApplying photon-level pixel offset correction "
+              f"from {Path(_offset_path).name} ...")
+        try:
+            import numpy as _np
+            _omap = _np.load(_offset_path)
+            d = apply_offset_to_photons(d, _omap, d["tpb"])
+        except Exception as _exc:
+            print(f"  WARNING: photon offset correction failed ({_exc}); "
+                  f"continuing without it.")
 
     step_s = args.step
     if step_s is None:
