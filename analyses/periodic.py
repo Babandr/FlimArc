@@ -35,7 +35,8 @@ from flim_core.irf import (
 )
 from analyses._common import (
     apply_spatial_and_time_binning,
-    load_raw_with_time, assign_phase_groups, build_group_cube, crop_photon_data, process_group,
+    load_raw_with_time, assign_phase_groups, build_group_cube, crop_photon_data,
+    apply_offset_to_photons, process_group,
 )
 
 NAME = 'Periodic (pixel-wise)'
@@ -61,7 +62,7 @@ def preview_slice(loaded_data, settings):
     return img, cube, "first phase group"
 
 
-def plot_phase_summary(results, n_groups, period_s, prefix, show, mono):
+def plot_phase_summary(results, n_groups, period_s, prefix, show, mono, args=None):
     """Final window: median lifetime vs phase group, across the whole period --
     this is the actual periodic-change trace the whole exercise is for."""
     centers = [(r["group"] + 0.5) * period_s / n_groups for r in results if r is not None]
@@ -87,7 +88,7 @@ def plot_phase_summary(results, n_groups, period_s, prefix, show, mono):
 
     out_npz = f"{prefix}_phase_summary.npz"
     n_pixels = [r["n_pixels"] if r is not None else 0 for r in results]
-    pixel_offset_path = getattr(args, "pixel_offset", None)
+    pixel_offset_path = getattr(args, "pixel_offset", None) if args is not None else None
     np.savez(out_npz, phase_center_s=np.array(centers), median=np.array(medians),
              iqr_low=np.array(lo), iqr_high=np.array(hi), n_pixels=np.array(n_pixels),
              period_s=period_s, n_groups=n_groups, mono=mono,
@@ -400,7 +401,7 @@ def run(args):
         results.append(r)
 
     if any(r is not None for r in results):
-        plot_phase_summary(results, n_groups, period_s, prefix, not args.no_show, args.mono)
+        plot_phase_summary(results, n_groups, period_s, prefix, not args.no_show, args.mono, args=args)
 
     print(f"\nDone. Processed {sum(r is not None for r in results)}/{n_groups} groups.")
 

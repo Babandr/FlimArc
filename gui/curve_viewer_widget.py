@@ -241,11 +241,19 @@ class CurveViewerWidget(tk.Frame):
         """
         Call after all add_curve() calls to update the legend and redraw.
         Must be the last call in every _refresh_plot() implementation.
+
+        Calls nav.update() after every redraw so the toolbar's home position
+        always matches the current data range.  Without this, pressing the
+        home button after changing binning or time-bin restores the axis
+        limits from the very first curve that was ever plotted, which is
+        wrong when the x-range or y-range has changed (e.g. after time-
+        binning the x axis spans fewer, wider bins).
         """
         handles = [l for l in self._ax.lines if l.get_label()]
         if show_legend and handles:
             self._ax.legend(fontsize=8, framealpha=0.7)
         self._canvas.draw_idle()
+        self._nav.update()   # adopt current limits as the new home position
 
     def clear(self) -> None:
         """Remove all curves, reset the colour cycle, reapply axis style."""

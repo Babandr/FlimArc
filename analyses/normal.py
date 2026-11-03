@@ -470,10 +470,10 @@ def process_file(h5file, args):
             print(f"  tau_long_std: median {np.median(std_v):.3f} ns")
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, tau_long, threshold, min_neighbors,
-                         f"{prefix}_results.png", show, bin_size=plot_bin_size)
+                         f"{prefix}_results.png", show, bin_size=plot_bin_size, vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_long_std"], fit["n_photons"], mask, f"{prefix}_quality.png", show,
-                             symbol="\u03c4_long", converged_map=fit["converged"], vlim=getattr(args, "lifetime_vlim", None))
+                             symbol="\u03c4_long", converged_map=fit["converged"])
         np.savez(f"{prefix}_maps.npz",
                  photons_per_pixel=img, mask=mask, removed_isolated=removed,
                  tau_long_ns=tau_long, tau_short_ns=tau_short,

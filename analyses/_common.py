@@ -534,10 +534,10 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
                 print(f"  tau_long_std: median {np.median(std_v):.3f} ns")
         if getattr(args, "save_results", True):
             plot_results(img, mask, removed, tau_long, threshold, min_neighbors,
-                         f"{gprefix}_results.png", not args.no_show, bin_size=args.bin)
+                         f"{gprefix}_results.png", not args.no_show, bin_size=args.bin, vlim=getattr(args, "lifetime_vlim", None))
         if getattr(args, "save_quality_plots", True):
             plot_fit_quality(fit["tau_long_std"], fit["n_photons"], mask, f"{gprefix}_quality.png",
-                             not args.no_show, symbol="\u03c4_long", converged_map=fit["converged"], vlim=getattr(args, "lifetime_vlim", None))
+                             not args.no_show, symbol="\u03c4_long", converged_map=fit["converged"])
         np.savez(f"{gprefix}_maps.npz",
                  photons_per_pixel=img, mask=mask, removed_isolated=removed,
                  tau_long_ns=tau_long, tau_short_ns=tau_short,
