@@ -12,8 +12,8 @@ Works on BOTH raw photon-stream files AND exported/.ds3d histogram files,
 same as analyses/normal.py -- there is no time/phase splitting here.
 
 IRF reconvolution fitting (fit_whole_image_reconv, below) mirrors the same
-pattern as analyses/normal.py's per-pixel version: load the IRF, align it
-to the pooled masked curve once via estimate_shift, then fit (or compute
+pattern as analyses/normal.py's per-pixel version: load the IRF, use it
+as measured (the fit finds the timing offset), then fit (or compute
 the IRF-corrected mean arrival time of) that one pooled curve.
 """
 
@@ -30,7 +30,7 @@ from flim_core.masking import (
     report_dead_pixels, load_mask,
 )
 from flim_core.fitting import _tail_axis, global_fit
-from flim_core.irf import load_irf, estimate_shift, shift_array, plot_irf_diagnostic
+from flim_core.irf import load_irf, plot_irf_diagnostic, fitted_timing_offset, _fitted_time_offset
 from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.bin_pattern import BinPatternCorrection
 from flim_core.plotting import plot_overview_and_mask
@@ -264,18 +264,16 @@ def process_file(h5file, args):
     irf_aligned = None
     if fit_method in ("irf", "mean_irf"):
         signal_sum = cube[mask].sum(axis=0).astype(float)
-        if no_shift:
-            # Skip the external pre-alignment entirely -- with the internal
-            # fit model also fixing shift at 0 (passed below), pre-shifting
-            # the kernel here would just reintroduce an offset through the
-            # back door.
-            shift = 0.0
-            irf_aligned = irf["irf_norm"]
-        else:
-            shift = estimate_shift(signal_sum, irf["irf_norm"])
-            irf_aligned = shift_array(irf["irf_norm"], shift)
-        print(f"\n  IRF-to-data alignment: shift = {shift} bins ({shift*s['tpb']*1e9:.3f} ns)"
-              f"{' (fixed, not fitted)' if no_shift else ''}")
+        # The IRF is used exactly as measured -- no external pre-alignment. The fit models find the
+        # IRF/data timing offset themselves (free shift parameter), or hold it at "no offset" with
+        # --no-shift. Pre-shifting the IRF onto the decay's PEAK used to be done here, but that only moved
+        # the decay's peak lag (~17 bins for a 0.7 ns IRF and a 4 ns dye, more for longer lifetimes or
+        # broader IRFs) into the fit's free shift, which then broke whenever IRF_SHIFT_SEARCH was smaller
+        # than that lag. The measured offset is reported in the *_irf_check.png.
+        shift = 0.0
+        irf_aligned = irf["irf_norm"]
+        print(f"\n  IRF-to-data timing offset: "
+              f"{'fixed at 0 (--no-shift)' if no_shift else 'fitted together with the lifetime (see the IRF check plot)'}")
 
     if fit_method == "mean_irf":
         if args.mono:
@@ -291,6 +289,8 @@ def process_file(h5file, args):
         print(f"  tau_mean (IRF-corrected) = {tau_mean:.2f} ns  (std = {tau_mean_std:.3f} ns)")
 
         summed = cube[mask].sum(axis=0).astype(float)
+        # saved as irf_shift: the fitted IRF/data timing offset in bins (it used to be the peak alignment)
+        irf_shift = 0.0 if no_shift else _fitted_time_offset(summed, irf_aligned, s["tpb"] * 1e9)
         if getattr(args, "save_results", True):
             plot_pooled_mean_arrival(summed, s["tpb"], tau_mean, tau_mean_std,
                                      f"Whole image ({int(mask.sum())} masked {unit}): "
@@ -299,7 +299,7 @@ def process_file(h5file, args):
 
         np.savez(f"{prefix}_maps.npz",
                  photons_per_pixel=img, mask=mask, n_photons=n_photons,
-                 tau_mean_ns=tau_mean, tau_mean_std_ns=tau_mean_std, irf_shift=shift,
+                 tau_mean_ns=tau_mean, tau_mean_std_ns=tau_mean_std, irf_shift=irf_shift,
                  threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
                  pixel_offset_calibration=pixel_offset_meta,
@@ -366,11 +366,12 @@ def process_file(h5file, args):
             plot_irf_diagnostic(irf, summed, shift, g, s["tpb"], f"{prefix}_irf_check.png", show,
                                 n_signal=int(mask.sum()), unit=unit)
 
+        irf_shift = fitted_timing_offset(g, shift)   # saved below: fitted IRF/data timing offset, bins
         if args.mono:
             print(f"  tau_std = {g.get('tau_std', float('nan')):.3f} ns  (n_photons = {n_photons})")
             np.savez(f"{prefix}_maps.npz",
                      photons_per_pixel=img, mask=mask, n_photons=n_photons,
-                     tau_ns=g["tau"], tau_std_ns=g.get("tau_std", np.nan), model="mono", irf_shift=shift,
+                     tau_ns=g["tau"], tau_std_ns=g.get("tau_std", np.nan), model="mono", irf_shift=irf_shift,
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
                  pixel_offset_calibration=pixel_offset_meta,
@@ -382,7 +383,7 @@ def process_file(h5file, args):
                      photons_per_pixel=img, mask=mask, n_photons=n_photons,
                      tau_short_ns=g["tau_short"], tau_long_ns=g["tau_long"],
                      tau_short_std_ns=g.get("tau_short_std", np.nan), tau_long_std_ns=g.get("tau_long_std", np.nan),
-                     model="bi", irf_shift=shift,
+                     model="bi", irf_shift=irf_shift,
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=plot_bin_size, fit_method=fit_method,
                  moving_average=(moving_avg or 1), time_bin=time_bin,
                  pixel_offset_calibration=pixel_offset_meta,

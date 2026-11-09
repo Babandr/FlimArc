@@ -15,7 +15,8 @@ from scipy.signal import fftconvolve
 
 from .config import IRF_SHIFT_SEARCH, TAU_SHORT_BOUNDS, TAU_LONG_BOUNDS, TAU_MONO_BOUNDS
 from .io import load_flim_data, build_decay_cube
-from .fitting import _resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff
+from .fitting import (_resolve_bounds, _param_std, _param_std_full, _param_std_fisher, AnalysisCancelled,
+                      _tail_signal_cutoff, _poisson_fit, _tail_extrapolation)
 
 
 def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
@@ -182,6 +183,7 @@ def shift_array(a, shift):
     it to one leaves a systematic residual that the amplitude/tau
     parameters can't compensate for (confirmed on real data: this alone
     was enough to pin tau_short to its lower bound in every test)."""
+    shift = int(round(shift))   # fitted shifts are floats; this helper is integer-only
     n = len(a)
     out = np.zeros_like(a)
     if shift == 0:
@@ -234,6 +236,49 @@ def estimate_shift(data_summed, irf_norm, max_shift=IRF_SHIFT_SEARCH):
     return best_shift
 
 
+# The reconvolution models sample the exponential at the LEFT edge of each bin,
+# while the measured IRF counts are integrated across the bin. The two
+# conventions differ by half a bin, so a decay that shares its time origin with
+# the IRF (zero physical offset) is fitted with shift = +0.5 bins, not 0. The
+# physical offset between IRF and data is therefore  fitted shift - 0.5.
+_BIN_CONVENTION_SHIFT = 0.5
+
+
+def fitted_timing_offset(g, pre_shift=0.0):
+    """Physical timing offset between data and IRF, in bins (positive = the
+    data lag the IRF), read off a reconvolution fit result g.
+
+    g["shift"] is the shift the fit applied to its model, which includes the
+    +0.5-bin sampling convention (see _BIN_CONVENTION_SHIFT) and compensates
+    whatever pre_shift the caller applied to the IRF beforehand (the plugins
+    still pre-align it on the decay's peak, ~15 bins, as a starting point).
+    The physical offset is therefore  g["shift"] + pre_shift - 0.5, whichever
+    way the IRF was prepared; with --no-shift the model shift is fixed at 0.5,
+    so this is exactly 0. Returns NaN if g has no "shift"."""
+    if g is None or g.get("shift") is None:
+        return float("nan")
+    return float(g["shift"]) + float(pre_shift) - _BIN_CONVENTION_SHIFT
+
+
+def _fitted_time_offset(signal_sum, irf_norm, tpb_ns):
+    """Physical timing offset (bins; positive = the data lags the IRF) between
+    the data and the IRF, from ONE mono-exponential reconvolution fit of the
+    pooled curve, with the half-bin convention removed (see
+    _BIN_CONVENTION_SHIFT). This is a sub-bin estimate of the TIME-ZERO offset.
+    estimate_shift cannot provide that: it aligns the IRF to the decay's PEAK,
+    and a decay's peak always lags its time zero, by about 4-7 bins for a
+    0.25 ns IRF and 50 ps bins, so using it as a time offset subtracts a
+    spurious ~0.3 ns from a moment-based lifetime.
+    Falls back to the coarse integer estimate if the fit fails."""
+    try:
+        fitted = float(global_reconv_fit(signal_sum, irf_norm, tpb_ns)["shift"])
+        if np.isfinite(fitted) and abs(fitted) < IRF_SHIFT_SEARCH:
+            return fitted - _BIN_CONVENTION_SHIFT
+    except Exception:
+        pass
+    return float(estimate_shift(signal_sum, irf_norm))
+
+
 def make_conv_model_mono(irf_norm, tpb_ns, fix_shift=None):
     """Mono-exponential reconvolution model(params) -> full decay curve.
     Normally params are (A, tau, C, shift), with `shift` (bins, continuous)
@@ -248,12 +293,15 @@ def make_conv_model_mono(irf_norm, tpb_ns, fix_shift=None):
     fix_shift=None (default): shift floats, params has 4 entries as above.
     fix_shift=<a number>: shift is fixed at that value (bins) instead of
     fitted -- params then has only 3 entries, (A, tau, C). Meant for
-    fix_shift=0.0 specifically: if the IRF and the data were acquired at
-    the same laser settings in the same session, there's no physical
-    timing-walk reason to expect a real offset between them, and removing
-    shift as a free parameter gives the optimizer one fewer degree of
-    freedom to chase noise with -- worth it exactly when you're confident
-    the premise (matched settings) actually holds."""
+    fix_shift=_BIN_CONVENTION_SHIFT (+0.5 bin, i.e. NO physical offset; see
+    that constant): if the IRF and the data were acquired at the same laser
+    settings in the same session, there's no physical timing-walk reason to
+    expect a real offset between them, and removing shift as a free
+    parameter gives the optimizer one fewer degree of freedom to chase noise
+    with -- worth it exactly when you're confident the premise (matched
+    settings) actually holds. (Not 0.0: the model samples the exponential at
+    the left edge of each bin while the IRF is integrated over the bin, so
+    zero physical offset corresponds to a model shift of half a bin.)"""
     nb = len(irf_norm)
     t = np.arange(nb) * tpb_ns
 
@@ -322,39 +370,57 @@ def make_conv_model_fixed(irf_norm, tpb_ns, tau_short_fixed, fix_shift=None):
     return model
 
 
-def global_reconv_fit_mono(data_summed, irf_norm, tpb_ns, tau_mono_bounds=None, no_shift=False):
+def _nll_offset(k):
+    """Constant that turns the Poisson deviance back into the plain negative
+    log-likelihood sum(m - k*log(m)): NLL = deviance + sum(k - k*log(k)) over
+    the bins with k > 0. Used so the per-pixel `nll` maps keep the same scale
+    as before the fits were switched to the deviance."""
+    kp = k[k > 0]
+    return float(np.sum(kp - kp * np.log(kp)))
+
+
+def global_reconv_fit_mono(data_summed, irf_norm, tpb_ns, tau_mono_bounds=None, no_shift=False,
+                          fit_background=True):
     """Mono-exponential reconvolution fit of the whole-image (or masked-only)
     summed decay -- reference/sanity-check fit, and available for --mono.
 
-    no_shift=True: fix the IRF/data timing shift at 0 instead of fitting it
-    (see make_conv_model_mono) -- use only when IRF and data were acquired
-    at matched laser settings in the same session."""
+    no_shift=True: assume NO physical timing offset between IRF and data
+    instead of fitting one -- use only when they were acquired at matched
+    laser settings in the same session. The model then holds its shift at
+    +0.5 bin, not 0: the model samples the exponential at the left edge of
+    each bin while the measured IRF is integrated over the bin, so a decay
+    that shares the IRF's time origin is fitted with shift = +0.5 (fixing it
+    at 0 left a half-bin error: 2.234 / 6.127 instead of 2.0 / 6.0 ns for a
+    2 + 6 ns decay). The returned `shift` is the shift used by the model, in
+    bins, in both modes; subtract 0.5 for the physical offset.
+
+    fit_background: True (default) fits a constant background C. False holds
+    C = 0 -- only for data that really contain no background (otherwise tau
+    is biased long); do not pre-subtract background and then use False."""
     _, _, tau_mono_bounds = _resolve_bounds(None, None, tau_mono_bounds)
     yv = data_summed.astype(float)
-    model = make_conv_model_mono(irf_norm, tpb_ns, fix_shift=0.0 if no_shift else None)
-
-    def nll(p):
-        m = np.maximum(model(p), 1e-9)
-        return np.sum(m - yv * np.log(m))
+    model = make_conv_model_mono(irf_norm, tpb_ns, fix_shift=_BIN_CONVENTION_SHIFT if no_shift else None)
 
     pk = yv.max()
-    bg0 = max(np.percentile(yv, 2), 0.5)
+    bg0 = max(np.percentile(yv, 2), 0.5) if fit_background else 0.0
+    c_max = pk if fit_background else 0.0
     if no_shift:
         p0 = [pk, sum(tau_mono_bounds) / 2, bg0]
-        bounds = [(0, pk * 10), tau_mono_bounds, (0, pk)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A, tau, C = r.x
-        shift = 0.0
+        bounds = [(0, pk * 10), tau_mono_bounds, (0, c_max)]
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A, tau, C = x
+        shift = _BIN_CONVENTION_SHIFT
     else:
         shift0 = estimate_shift(yv, irf_norm)   # coarse integer seed only -- refined below
         p0 = [pk, sum(tau_mono_bounds) / 2, bg0, shift0]
-        bounds = [(0, pk * 10), tau_mono_bounds, (0, pk), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A, tau, C, shift = r.x
-    return dict(tau=tau, tau_std=_param_std(nll, r.x, 1), popt=r.x, model=model, yv=yv, mono=True, shift=shift)
+        bounds = [(0, pk * 10), tau_mono_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A, tau, C, shift = x
+    return dict(tau=tau, tau_std=_param_std_full(nll, x, 1, bounds=bounds), popt=x, model=model, yv=yv, mono=True, shift=shift)
 
 
-def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, cancel_check=None, no_shift=False):
+def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, cancel_check=None, no_shift=False,
+                           fit_background=True):
     """Per-(super-)pixel mono-exponential reconvolution fit on masked pixels,
     using the full decay curve.
 
@@ -363,10 +429,13 @@ def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, c
 
     cancel_check: optional zero-arg callable, checked once per pixel;
     raises AnalysisCancelled if it returns True (see flim_core.fitting).
-    no_shift: see global_reconv_fit_mono -- same meaning, applied per pixel."""
+    no_shift, fit_background: see global_reconv_fit_mono -- same meaning, applied per
+    pixel. The fit uses the scaled Poisson deviance (see fitting._poisson_fit), which
+    stays accurate at very high photon counts; the `nll` map keeps the plain
+    negative-log-likelihood scale."""
     _, _, tau_mono_bounds = _resolve_bounds(None, None, tau_mono_bounds)
     H, W, nb = cube.shape
-    model = make_conv_model_mono(irf_norm, tpb_ns, fix_shift=0.0 if no_shift else None)
+    model = make_conv_model_mono(irf_norm, tpb_ns, fix_shift=_BIN_CONVENTION_SHIFT if no_shift else None)
     tau_map = np.full((H, W), np.nan)
     tau_std_map = np.full((H, W), np.nan)
     n_photons_map = np.zeros((H, W))
@@ -375,32 +444,29 @@ def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, c
     tau_seed = sum(tau_mono_bounds) / 2
     shift_seed = None if no_shift else estimate_shift(cube.sum(axis=(0, 1)).astype(float), irf_norm)
 
-    def nll(p, k):
-        m = np.maximum(model(p), 1e-9)
-        return np.sum(m - k * np.log(m))
-
     ys, xs = np.where(mask)
     total = len(ys)
     print(f"  fitting {total} pixels (mono-exponential, full-curve reconvolution"
-          f"{', shift fixed at 0' if no_shift else ''}) ...", flush=True)
+          f"{', no IRF offset (shift fixed)' if no_shift else ''}) ...", flush=True)
     for n, (i, j) in enumerate(zip(ys, xs)):
         if cancel_check is not None and cancel_check():
             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
         k = cube[i, j, :].astype(float)
         pk = max(k.max(), 1.0)
-        bg = max(np.median(k[-max(20, nb // 20):]), 0.5)
+        bg = max(np.median(k[-max(20, nb // 20):]), 0.5) if fit_background else 0.0
+        c_max = pk if fit_background else 0.0
         if no_shift:
             p0 = [pk, tau_seed, bg]
-            bnds = [(0, pk * 6), tau_mono_bounds, (0, pk)]
+            bnds = [(0, pk * 6), tau_mono_bounds, (0, c_max)]
         else:
             p0 = [pk, tau_seed, bg, shift_seed]
-            bnds = [(0, pk * 6), tau_mono_bounds, (0, pk), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-        r = minimize(nll, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
-        tau_map[i, j] = r.x[1]
-        tau_std_map[i, j] = _param_std(nll, r.x, 1, args=(k,))
+            bnds = [(0, pk * 6), tau_mono_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+        x, dev, r = _poisson_fit(model, k, p0, bnds, ftol=1e-10, gtol=1e-6, return_result=True)
+        tau_map[i, j] = x[1]
+        tau_std_map[i, j] = _param_std_fisher(model, x, 1, bounds=bnds, fallback=lambda: _param_std(dev, x, 1))
         n_photons_map[i, j] = k.sum()
         converged_map[i, j] = bool(r.success)
-        nll_map[i, j] = r.fun
+        nll_map[i, j] = dev(x) + _nll_offset(k)
         if total > 500 and (n + 1) % 500 == 0:
             print(f"    {n + 1}/{total}", flush=True)
     return dict(tau=tau_map, tau_std=tau_std_map, n_photons=n_photons_map,
@@ -408,7 +474,7 @@ def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, c
 
 
 def global_reconv_fit_fixed_short(data_summed, irf_norm, tpb_ns, tau_short_fixed, tau_long_bounds=None,
-                                   no_shift=False):
+                                   no_shift=False, fit_background=True):
     """Biexponential reconvolution fit of a summed decay curve with
     tau_short pinned to a known value; only tau_long (and the amplitudes/
     background) float. Mirrors global_reconv_fit, just with fewer free
@@ -416,72 +482,68 @@ def global_reconv_fit_fixed_short(data_summed, irf_norm, tpb_ns, tau_short_fixed
     be reused for a specific pooled-curve fit (e.g. one window/group of a
     whole-image timelapse/periodic run).
 
-    no_shift: see global_reconv_fit_mono -- same meaning."""
+    no_shift, fit_background: see global_reconv_fit_mono -- same meaning."""
     _, tau_long_bounds, _ = _resolve_bounds(None, tau_long_bounds, None)
     yv = data_summed.astype(float)
-    model = make_conv_model_fixed(irf_norm, tpb_ns, tau_short_fixed, fix_shift=0.0 if no_shift else None)
-
-    def nll(p):
-        m = np.maximum(model(p), 1e-9)
-        return np.sum(m - yv * np.log(m))
+    model = make_conv_model_fixed(irf_norm, tpb_ns, tau_short_fixed, fix_shift=_BIN_CONVENTION_SHIFT if no_shift else None)
 
     pk = yv.max()
-    bg0 = max(np.percentile(yv, 2), 0.5)
+    bg0 = max(np.percentile(yv, 2), 0.5) if fit_background else 0.0
+    c_max = pk if fit_background else 0.0
     if no_shift:
         p0 = [pk * 0.6, pk * 0.4, sum(tau_long_bounds) / 2, bg0]
-        bounds = [(0, pk * 10), (0, pk * 10), tau_long_bounds, (0, pk)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A1, A2, t2, C = r.x
-        shift = 0.0
+        bounds = [(0, pk * 10), (0, pk * 10), tau_long_bounds, (0, c_max)]
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A1, A2, t2, C = x
+        shift = _BIN_CONVENTION_SHIFT
     else:
         shift0 = estimate_shift(yv, irf_norm)
         p0 = [pk * 0.6, pk * 0.4, sum(tau_long_bounds) / 2, bg0, shift0]
-        bounds = [(0, pk * 10), (0, pk * 10), tau_long_bounds, (0, pk), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A1, A2, t2, C, shift = r.x
-    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_param_std(nll, r.x, 2),
-               popt=r.x, model=model, yv=yv, mono=False, shift=shift)
+        bounds = [(0, pk * 10), (0, pk * 10), tau_long_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A1, A2, t2, C, shift = x
+    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_param_std_full(nll, x, 2, bounds=bounds),
+               popt=x, model=model, yv=yv, mono=False, shift=shift)
 
 
 def global_reconv_fit(data_summed, irf_norm, tpb_ns, tau_short_bounds=None, tau_long_bounds=None,
-                       no_shift=False):
+                       no_shift=False, fit_background=True):
     """Robust reconvolution fit of the whole-image summed decay -- used both
     as a sanity-check reference and (optionally) to supply a fixed tau_short
     for the per-pixel fits.
 
-    no_shift: see global_reconv_fit_mono -- same meaning."""
+    no_shift, fit_background: see global_reconv_fit_mono -- same meaning."""
     tau_short_bounds, tau_long_bounds, _ = _resolve_bounds(tau_short_bounds, tau_long_bounds, None)
     yv = data_summed.astype(float)
-    model = make_conv_model(irf_norm, tpb_ns, fix_shift=0.0 if no_shift else None)
-
-    def nll(p):
-        m = np.maximum(model(p), 1e-9)
-        return np.sum(m - yv * np.log(m))
+    model = make_conv_model(irf_norm, tpb_ns, fix_shift=_BIN_CONVENTION_SHIFT if no_shift else None)
 
     pk = yv.max()
-    bg0 = max(np.percentile(yv, 2), 0.5)
+    bg0 = max(np.percentile(yv, 2), 0.5) if fit_background else 0.0
+    c_max = pk if fit_background else 0.0
     if no_shift:
         p0 = [pk * 0.6, sum(tau_short_bounds) / 2, pk * 0.4, sum(tau_long_bounds) / 2, bg0]
-        bounds = [(0, pk * 10), tau_short_bounds, (0, pk * 10), tau_long_bounds, (0, pk)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A1, t1, A2, t2, C = r.x
-        shift = 0.0
+        bounds = [(0, pk * 10), tau_short_bounds, (0, pk * 10), tau_long_bounds, (0, c_max)]
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A1, t1, A2, t2, C = x
+        shift = _BIN_CONVENTION_SHIFT
     else:
         shift0 = estimate_shift(yv, irf_norm)
         p0 = [pk * 0.6, sum(tau_short_bounds) / 2, pk * 0.4, sum(tau_long_bounds) / 2, bg0, shift0]
-        bounds = [(0, pk * 10), tau_short_bounds, (0, pk * 10), tau_long_bounds, (0, pk),
+        bounds = [(0, pk * 10), tau_short_bounds, (0, pk * 10), tau_long_bounds, (0, c_max),
                   (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-        r = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
-        A1, t1, A2, t2, C, shift = r.x
+        x, nll = _poisson_fit(model, yv, p0, bounds)
+        A1, t1, A2, t2, C, shift = x
     idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
     ts, tl = sorted([t1, t2])
     return dict(tau_short=ts, tau_long=tl,
-               tau_short_std=_param_std(nll, r.x, idx_short), tau_long_std=_param_std(nll, r.x, idx_long),
-               popt=r.x, model=model, yv=yv, shift=shift)
+               tau_short_std=_param_std_full(nll, x, idx_short, bounds=bounds),
+               tau_long_std=_param_std_full(nll, x, idx_long, bounds=bounds),
+               popt=x, model=model, yv=yv, shift=shift)
 
 
 def fit_pixels_reconv(cube, irf_norm, tpb_ns, mask, tau_short_fixed=None,
-                      tau_short_bounds=None, tau_long_bounds=None, cancel_check=None, no_shift=False):
+                      tau_short_bounds=None, tau_long_bounds=None, cancel_check=None, no_shift=False,
+                      fit_background=True):
     """
     Per-(super-)pixel reconvolution fit on masked pixels, using the FULL
     decay curve (not just a tail) -- this is what lets the fit use every
@@ -494,7 +556,9 @@ def fit_pixels_reconv(cube, irf_norm, tpb_ns, mask, tau_short_fixed=None,
       tau_long, tau_short, tau_long_std, tau_short_std, n_photons, converged, nll
 
     cancel_check: see fit_pixels_reconv_mono -- same optional per-pixel interrupt.
-    no_shift: see global_reconv_fit_mono -- same meaning, applied per pixel.
+    no_shift, fit_background: see global_reconv_fit_mono -- same meaning, applied per
+    pixel. The fit uses the scaled Poisson deviance (see fitting._poisson_fit); the
+    `nll` map keeps the plain negative-log-likelihood scale.
     """
     tau_short_bounds, tau_long_bounds, _ = _resolve_bounds(tau_short_bounds, tau_long_bounds, None)
     H, W, nb = cube.shape
@@ -508,60 +572,53 @@ def fit_pixels_reconv(cube, irf_norm, tpb_ns, mask, tau_short_fixed=None,
     nll_map = np.full((H, W), np.nan)
     ts_seed = sum(tau_short_bounds) / 2
     tl_seed = sum(tau_long_bounds) / 2
-    fix_shift = 0.0 if no_shift else None
+    fix_shift = _BIN_CONVENTION_SHIFT if no_shift else None
     shift_seed = None if no_shift else estimate_shift(cube.sum(axis=(0, 1)).astype(float), irf_norm)
 
     model_free = make_conv_model(irf_norm, tpb_ns, fix_shift=fix_shift)
     model_fixed = make_conv_model_fixed(irf_norm, tpb_ns, tau_short_fixed, fix_shift=fix_shift) \
         if tau_short_fixed else None
 
-    def nll_free(p, k):
-        m = np.maximum(model_free(p), 1e-9)
-        return np.sum(m - k * np.log(m))
-
-    def nll_fixed(p, k):
-        m = np.maximum(model_fixed(p), 1e-9)
-        return np.sum(m - k * np.log(m))
-
     ys, xs = np.where(mask)
     total = len(ys)
     print(f"  fitting {total} pixels (full-curve reconvolution"
-          f"{', shift fixed at 0' if no_shift else ''}) ...", flush=True)
+          f"{', no IRF offset (shift fixed)' if no_shift else ''}) ...", flush=True)
     for n, (i, j) in enumerate(zip(ys, xs)):
         if cancel_check is not None and cancel_check():
             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
         k = cube[i, j, :].astype(float)
         pk = max(k.max(), 1.0)
-        bg = max(np.median(k[-max(20, nb // 20):]), 0.5)   # baseline from the far tail
+        bg = max(np.median(k[-max(20, nb // 20):]), 0.5) if fit_background else 0.0   # baseline from the far tail
+        c_max = pk if fit_background else 0.0
         if tau_short_fixed is None:
             if no_shift:
                 p0 = [pk * 0.6, ts_seed, pk * 0.4, tl_seed, bg]
-                bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, pk)]
+                bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, c_max)]
             else:
                 p0 = [pk * 0.6, ts_seed, pk * 0.4, tl_seed, bg, shift_seed]
-                bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, pk),
+                bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, c_max),
                         (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-            r = minimize(nll_free, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
-            t1, t2 = r.x[1], r.x[3]
+            x, dev, r = _poisson_fit(model_free, k, p0, bnds, ftol=1e-10, gtol=1e-6, return_result=True)
+            t1, t2 = x[1], x[3]
             idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
             tau_short[i, j], tau_long[i, j] = sorted([t1, t2])
-            tau_short_std[i, j] = _param_std(nll_free, r.x, idx_short, args=(k,))
-            tau_long_std[i, j] = _param_std(nll_free, r.x, idx_long, args=(k,))
+            tau_short_std[i, j] = _param_std_fisher(model_free, x, idx_short, bounds=bnds, fallback=lambda: _param_std(dev, x, idx_short))
+            tau_long_std[i, j] = _param_std_fisher(model_free, x, idx_long, bounds=bnds, fallback=lambda: _param_std(dev, x, idx_long))
         else:
             if no_shift:
                 p0 = [pk * 0.6, pk * 0.4, tl_seed, bg]
-                bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, pk)]
+                bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, c_max)]
             else:
                 p0 = [pk * 0.6, pk * 0.4, tl_seed, bg, shift_seed]
-                bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, pk),
+                bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, c_max),
                         (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
-            r = minimize(nll_fixed, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+            x, dev, r = _poisson_fit(model_fixed, k, p0, bnds, ftol=1e-10, gtol=1e-6, return_result=True)
             tau_short[i, j] = tau_short_fixed
-            tau_long[i, j] = r.x[2]
-            tau_long_std[i, j] = _param_std(nll_fixed, r.x, 2, args=(k,))
+            tau_long[i, j] = x[2]
+            tau_long_std[i, j] = _param_std_fisher(model_fixed, x, 2, bounds=bnds, fallback=lambda: _param_std(dev, x, 2))
         n_photons_map[i, j] = k.sum()
         converged_map[i, j] = bool(r.success)
-        nll_map[i, j] = r.fun
+        nll_map[i, j] = dev(x) + _nll_offset(k)
         if total > 500 and (n + 1) % 500 == 0:
             print(f"    {n + 1}/{total}", flush=True)
     return dict(tau_long=tau_long, tau_short=tau_short,
@@ -569,7 +626,8 @@ def fit_pixels_reconv(cube, irf_norm, tpb_ns, mask, tau_short_fixed=None,
                n_photons=n_photons_map, converged=converged_map, nll=nll_map)
 
 
-def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
+def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False, shift_method="fit",
+                             correct_bias=True):
     """IRF-corrected intensity-weighted mean arrival time, per masked pixel
     -- a fit-free (no nonlinear optimization) alternative to the biexponential
     reconvolution fit, in the same spirit as fitting.mean_arrival_time but
@@ -592,16 +650,32 @@ def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
     On REAL two-file data (a separately-recorded IRF file), that shared-
     origin assumption doesn't hold automatically: the IRF and decay
     acquisitions can carry a genuine relative timing offset (electronics,
-    cabling, or just being separate acquisitions), the same offset the
-    reconvolution fits solve for via a free `shift` parameter. A moment
-    calculation has no such per-fit freedom to compensate, so this function
-    aligns irf_norm to the data ONCE, via the same coarse estimate_shift()
-    cross-correlation used to seed the reconvolution fits, before taking its
-    moment. This won't be as precise as a fitted sub-bin shift (on real data,
-    skipping it entirely left an uncorrected timing bias of several tenths
-    of a ns), but keeps this method's core advantage -- no nonlinear fit at
-    all, safe even at very low photon counts -- rather than requiring a
-    biexponential fit first just to get a precise shift.
+    cabling, or just being separate acquisitions). If the data lag the IRF
+    by delta, mean(data) = tau + mean(irf) + delta, so delta has to be
+    estimated and subtracted too. shift_method chooses how:
+      "fit" (default): delta comes from ONE biexponential reconvolution
+        fit of the pooled (masked-region) curve, with its half-bin sampling
+        convention removed -- a sub-bin estimate of the true time-zero offset
+        (see _fitted_time_offset). One fit on one curve, so the per-pixel
+        moments stay fit-free and safe at low photon counts.
+      "xcorr": the previous behaviour, the integer cross-correlation
+        estimate_shift. That aligns the IRF to the decay's PEAK, which lags
+        the time zero by several bins, so it biases tau_mean low by about
+        0.3 ns (5.4 instead of 5.8 ns for a 6 ns decay; 1.65 instead of 1.95
+        for 2 ns). Kept only to reproduce old runs.
+    no_shift=True skips the offset entirely (delta = 0): use it only when IRF
+    and data were acquired with matched laser settings in the same session.
+    Because first moments add, the result does not depend on whether the
+    caller already shifted irf_norm beforehand.
+
+    correct_bias=True (default) adds back the signal that the 99.5 % cutoff
+    below discards: the pooled curve's tail beyond the cutoff is extrapolated
+    as an exponential and each pixel gets a share proportional to its own
+    late signal (see fitting.mean_arrival_time and _tail_extrapolation). That
+    lost light is the latest, so without this the mean reads about 3 % low
+    (5.80 instead of 6.0 ns for a 6 ns decay). No bin-centre term is needed
+    here: data and IRF are binned the same way, so it cancels in the
+    subtraction. False reproduces the previous numbers.
 
     Two more things this borrows directly from fitting.mean_arrival_time,
     after an early version of this function (using the full window and
@@ -645,20 +719,24 @@ def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
     t_bins = np.arange(nb)
 
     signal_sum = cube[mask].sum(axis=0).astype(float)
+    if shift_method not in ("fit", "xcorr"):
+        raise ValueError(f"shift_method must be 'fit' or 'xcorr', got {shift_method!r}")
     if no_shift:
         # See make_conv_model_mono's no_shift docs: matched laser settings
         # between IRF and data mean no physical timing-walk offset is
         # expected, so skip the alignment step entirely.
         shift = 0.0
-        irf_aligned = irf_norm
+    elif shift_method == "xcorr":
+        shift = float(estimate_shift(signal_sum, irf_norm))
     else:
-        shift = estimate_shift(signal_sum, irf_norm)
-        irf_aligned = shift_array(irf_norm, shift)
-    irf_mean_bins = np.sum(t_bins * irf_aligned)   # irf_aligned already sums to 1
+        shift = _fitted_time_offset(signal_sum, irf_norm, tpb_ns)
+    # First moment of the IRF delayed by `shift` bins (irf_norm sums to 1).
+    irf_mean_bins = np.sum(t_bins * irf_norm) + shift
 
     n_bg_bins = min(20, nb)
     pooled_bs = signal_sum - np.mean(signal_sum[-n_bg_bins:])
     cutoff = _tail_signal_cutoff(pooled_bs)
+    ext = _tail_extrapolation(pooled_bs, cutoff) if correct_bias else None
     t_bins_c = t_bins[:cutoff]
 
     tau_mean = np.full((H, W), np.nan)
@@ -689,12 +767,18 @@ def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
         noise_floor = np.sqrt(max(cutoff * bg_i, 1.0))
         if N <= 3 * noise_floor:
             continue
-        data_mean_bins = np.sum(t_bins_c * y) / N
+        weighted_sum = np.sum(t_bins_c * y)
+        trunc_mean_bins = weighted_sum / N                 # mean over the kept window
+        if ext is not None:
+            share = y[cutoff - ext["share_len"]:cutoff].sum() / ext["s_share"]   # NOT clipped: noise stays zero-mean
+            data_mean_bins = (weighted_sum + share * ext["m_ext"]) / (N + share * ext["n_ext"])
+        else:
+            data_mean_bins = trunc_mean_bins
         tau_mean_i = (data_mean_bins - irf_mean_bins) * tpb_ns
         # Exact SEM of the weighted-mean estimator, same formula as
         # fitting.mean_arrival_time -- the IRF subtraction is a constant
         # shift, so it doesn't add variance; only the data's own spread does.
-        var_t = np.sum(y * (t_bins_c - data_mean_bins) ** 2) / N
+        var_t = np.sum(y * (t_bins_c - trunc_mean_bins) ** 2) / N
         # Unlike fitting.mean_arrival_time's tail-only window (short, close
         # to the mean it's centered on), this function's window runs the
         # full pooled-cutoff range from bin 0 -- on real data, up to ~30 ns,
@@ -718,36 +802,69 @@ def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
     return dict(tau_mean=tau_mean, tau_mean_std=tau_mean_std, n_photons=n_photons_map, shift=shift)
 
 
+def _shift_linear(a, shift):
+    """Shift array `a` later by `shift` bins (any float) with linear
+    interpolation and zero fill. Used only to DRAW the IRF: unlike the FFT
+    shift the fits use (shift_signal_subbin), it has no ringing around the
+    IRF window's sharp edges, which showed up as a fuzzy band on the log
+    plot."""
+    idx = np.arange(len(a), dtype=float)
+    return np.interp(idx - float(shift), idx, a, left=0.0, right=0.0)
+
+
 def plot_irf_diagnostic(irf, signal_sum, shift, g, tpb, out_png, show, n_signal, unit):
     """Signal-only summed data decay (from the masked pixels/super-pixels)
-    vs the (aligned, background-subtracted) IRF vs the fitted reconvolution
-    model -- a visual check that the IRF genuinely explains the data's
-    rising edge and that the fit tracks the measured curve."""
+    vs the (background-subtracted) IRF vs the fitted reconvolution model -- a
+    visual check that the IRF genuinely explains the data's rising edge and
+    that the fit tracks the measured curve.
+
+    `shift` is the integer the caller pre-shifted the IRF by (the coarse
+    peak alignment; 0 if none). The IRF is DRAWN at its real position
+    relative to the data: shifted by the fitted physical timing offset
+    (fitted_timing_offset), not by the peak alignment. A decay always peaks
+    later than its IRF (here ~0.6 ns for a 0.7 ns wide IRF and a 4 ns
+    lifetime) without any timing offset at all, so drawing the IRF on top of
+    the data peak, as this plot used to do, made a large offset look
+    necessary. The legend and title give the fitted offset (in ps) and that
+    expected peak lag."""
     nb = len(signal_sum)
     t_ns = np.arange(nb) * tpb * 1e9
-    irf_aligned = shift_array(irf["irf_norm"], shift) * signal_sum.max() / irf["irf_norm"].max()
+    offset = fitted_timing_offset(g, shift)
+    have_offset = np.isfinite(offset)
+    irf_drawn = _shift_linear(irf["irf_norm"], offset if have_offset else float(shift))
+    irf_drawn = irf_drawn * signal_sum.max() / irf["irf_norm"].max()
+    model_curve = g["model"](g["popt"])
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
     ax.semilogy(t_ns, signal_sum + 1, color="black", lw=1.2,
                 label=f"Data (summed over {n_signal} masked {unit})")
-    ax.semilogy(t_ns, irf_aligned + 1, color="tab:blue", lw=1.0, alpha=0.7,
-                label=f"IRF (background-subtracted, aligned, shift={shift} bins)")
+    if have_offset:
+        irf_label = (f"IRF (background-subtracted, at its fitted timing offset "
+                     f"{offset * tpb * 1e12:+.0f} ps = {offset:+.1f} bins)")
+    else:
+        irf_label = f"IRF (background-subtracted, aligned, shift={shift} bins)"
+    ax.semilogy(t_ns, irf_drawn + 1, color="tab:blue", lw=1.0, alpha=0.7, label=irf_label)
     if g.get("mono"):
         fit_label = f"Reconvolution fit (\u03c4={g['tau']:.2f} ns)"
     else:
         fit_label = f"Reconvolution fit (\u03c4s={g['tau_short']:.2f}, \u03c4l={g['tau_long']:.2f} ns)"
-    ax.semilogy(t_ns, g["model"](g["popt"]) + 1, color="tab:red", lw=1.2, ls="--",
-                label=fit_label)
+    ax.semilogy(t_ns, model_curve + 1, color="tab:red", lw=1.2, ls="--", label=fit_label)
     ax.set_xlabel("Time (ns)")
     ax.set_ylabel("Photon counts (+1, log scale)")
-    title = (f"IRF check: FWHM {irf['fwhm_bins']*tpb*1e9:.2f} ns, "
-             f"{irf['bg_fraction']*100:.0f}% of raw IRF was background (removed), "
-             f"source: {irf['source']}")
+    import textwrap
+    parts = [f"IRF check: FWHM {irf['fwhm_bins']*tpb*1e9:.2f} ns, "
+             f"{irf['bg_fraction']*100:.0f}% of raw IRF was background (removed)",
+             f"source: {irf['source']}"]
+    if have_offset:
+        lag_ns = t_ns[int(np.argmax(model_curve))] - t_ns[int(np.argmax(irf_drawn))]
+        parts.append(f"fitted IRF/data timing offset {offset * tpb * 1e12:+.0f} ps; the fitted decay peaks "
+                     f"{lag_ns:.2f} ns after the IRF peak (a decay always peaks after its IRF)")
     if irf.get("echo_fraction", 0) > 0.005:
-        title += (f"\n{irf['echo_fraction']*100:.1f}% of the background-subtracted IRF was a "
-                  f"disconnected secondary peak (windowed out, kept bins {irf['window'][0]}-{irf['window'][1]})")
-    ax.set_title(title, fontsize=10)
-    ax.legend(fontsize=9)
+        parts.append(f"{irf['echo_fraction']*100:.1f}% of the background-subtracted IRF was a "
+                     f"disconnected secondary peak (windowed out, kept bins {irf['window'][0]}-{irf['window'][1]})")
+    title = "\n".join(textwrap.fill(p, 105) for p in parts)
+    ax.set_title(title, fontsize=8.5)
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(out_png, dpi=130)
     print(f"  saved {out_png}")

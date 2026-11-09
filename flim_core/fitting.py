@@ -30,6 +30,8 @@ The whole-image pooled fits (global_fit and friends) gain the equivalent
 single-number tau_std/tau_short_std/tau_long_std in their returned dict.
 """
 
+import warnings
+
 import numpy as np
 from scipy.optimize import minimize, curve_fit
 
@@ -89,6 +91,200 @@ def _curve_fit_std(pcov, idx):
     return float(np.sqrt(var)) if var > 0 else np.nan
 
 
+def _poisson_fit(model, yv, p0, bounds, ftol=1e-12, gtol=1e-8, maxiter=2000, return_result=False):
+    """Poisson maximum-likelihood fit of model(params) to the counts yv with
+    L-BFGS-B, written to stay accurate at HIGH photon counts.
+
+    Why not minimize sum(m - y*log(m)) directly: that objective carries a huge
+    constant offset (about 4e7 at a few million photons) and the parameters
+    differ in size by orders of magnitude (A ~ 1e5, tau ~ 6, C ~ 40).
+    L-BFGS-B's relative stopping rule and its finite-difference gradient then
+    declare convergence well short of the optimum -- tau came out 3-7 % too
+    long on exact synthetic data (6.17 ns for a 6 ns decay). Two changes
+    remove that, without changing the optimum:
+
+      * the objective is the Poisson deviance  sum(m - y + y*log(y/m)),
+        i.e. the same likelihood minus a constant, so its value is ~O(nbins)
+        instead of ~O(photons);
+      * every parameter is divided by its starting value, so the optimizer
+        works on O(1) numbers (bounds are rescaled the same way).
+
+    Returns (params in the ORIGINAL units, objective(params in original
+    units)). The objective has the same curvature as the negative
+    log-likelihood, so it can be passed straight to _param_std /
+    _param_std_full. With return_result=True the scipy OptimizeResult is
+    returned as a third element (for success flags)."""
+    yv = np.asarray(yv, dtype=float)
+    pos = yv > 0
+    y_safe = np.where(pos, yv, 1.0)
+    p0 = np.asarray(p0, dtype=float)
+    scale = np.where(np.abs(p0) > 1e-6, np.abs(p0), 1.0)
+
+    def dev(p):
+        m = np.maximum(model(p), 1e-9)
+        return np.sum(m - yv + np.where(pos, yv * np.log(y_safe / m), 0.0))
+
+    z_bounds = [(lo / s, hi / s) for (lo, hi), s in zip(bounds, scale)]
+    r = minimize(lambda z: dev(z * scale), p0 / scale, method="L-BFGS-B",
+                 bounds=z_bounds, options=dict(ftol=ftol, gtol=gtol, maxiter=maxiter))
+    if return_result:
+        return r.x * scale, dev, r
+    return r.x * scale, dev
+
+
+def _poisson_refine(model, tn, yv, p_seed, bounds):
+    """Poisson ML refinement of a tail-fit model(t, *params), starting from
+    p_seed (e.g. a curve_fit result). Returns (popt, objective) or None if
+    the refinement failed (exception, non-finite result), so callers can fall
+    back to the seed instead of aborting a long run. Never returns a point
+    with a worse Poisson deviance than the seed."""
+    try:
+        seed = np.asarray(p_seed, dtype=float)
+        x, dev = _poisson_fit(lambda p: model(tn, *p), yv, seed, bounds)
+        d_new, d_seed = dev(x), dev(seed)
+        if not (np.all(np.isfinite(x)) and np.isfinite(d_new)):
+            return None
+        if np.isfinite(d_seed) and d_new > d_seed:
+            x = seed
+        return x, dev
+    except Exception:
+        return None
+
+
+def _param_std_full(nll_func, p_hat, idx, args=(), free=None, bounds=None):
+    """1-sigma uncertainty on parameter p_hat[idx] from the FULL numerical
+    Hessian of nll_func at the fit (central differences, all parameters
+    free): sigma = sqrt([H^-1]_idx,idx). Unlike _param_std, which holds the
+    other parameters fixed, this accounts for their correlations -- for a
+    biexponential the two lifetimes and amplitudes are strongly correlated,
+    and the fixed-parameter shortcut underestimates the error about 3-4x
+    (tested against the scatter of repeated fits). Costs ~n^2 evaluations,
+    fine for a one-off pooled fit; too slow to run per pixel. Returns NaN if
+    the Hessian isn't usable.
+
+    free: optional list of the parameter indices that were actually fitted.
+    Parameters held fixed (e.g. the background C when fit_background=False)
+    must be left out, otherwise their curvature would inflate the error of
+    the free ones as if they had been fitted too.
+
+    bounds: optional list of (low, high) per parameter. Parameters sitting ON
+    a bound are treated as fixed (the usual constrained-optimum convention).
+    If the requested parameter itself sits on a bound, its curvature isn't
+    meaningful and the fixed-parameter estimate (_param_std) is returned
+    instead."""
+    p = np.asarray(p_hat, dtype=float)
+    free = list(range(len(p))) if free is None else list(free)
+    if bounds is not None:
+        on_bound = [i for i, (lo, hi) in enumerate(bounds)
+                    if np.isclose(p[i], lo, rtol=1e-6, atol=1e-9) or np.isclose(p[i], hi, rtol=1e-6, atol=1e-9)]
+        if idx in on_bound:
+            return _param_std(nll_func, p_hat, idx, args=args)
+        free = [i for i in free if i not in on_bound]
+    n = len(free)
+    h = np.maximum(np.abs(p) * 0.01, 1e-4)
+    H = np.zeros((n, n))
+
+    def f(i, a, j, b):
+        q = p.copy()
+        q[i] += a * h[i]
+        q[j] += b * h[j]
+        return nll_func(q, *args)
+
+    try:
+        f0 = nll_func(p, *args)
+        for ii, i in enumerate(free):
+            H[ii, ii] = (f(i, 1, i, 0) - 2 * f0 + f(i, -1, i, 0)) / h[i] ** 2
+            for jj in range(ii + 1, n):
+                j = free[jj]
+                H[ii, jj] = H[jj, ii] = (f(i, 1, j, 1) - f(i, 1, j, -1)
+                                         - f(i, -1, j, 1) + f(i, -1, j, -1)) / (4 * h[i] * h[j])
+        var = _inv_diag_entry(H, free.index(idx))
+    except Exception:
+        return np.nan
+    return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
+
+
+def _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background=True):
+    """curve_fit of a tail model whose LAST parameter is the background C,
+    weighted by sqrt(max(counts, 1)) like the original fits. With
+    fit_background=False, C is held at 0: the fit runs on the model without
+    C, and popt/pcov are padded back to full size (C = 0, zero covariance)
+    so callers see the same parameter layout either way."""
+    sigma = np.sqrt(np.maximum(yv, 1))
+    if fit_background:
+        return curve_fit(model, tn, yv, p0=p0, sigma=sigma, bounds=(lo, hi), maxfev=20000)
+    popt, pcov = curve_fit(lambda t, *q: model(t, *q, 0.0), tn, yv, p0=list(p0)[:-1], sigma=sigma,
+                           bounds=(list(lo)[:-1], list(hi)[:-1]), maxfev=20000)
+    n = len(popt) + 1
+    pcov_full = np.zeros((n, n))
+    pcov_full[:-1, :-1] = pcov
+    return np.append(popt, 0.0), pcov_full
+
+
+def _inv_diag_entry(M, k):
+    """[M^-1]_kk for a symmetric information/Hessian matrix M, or NaN if
+    parameter k itself carries no information.
+
+    Parameters with (numerically) zero curvature are dropped first. That
+    happens in practice: when a biexponential pixel collapses to one
+    component (that component's amplitude pinned at 0), its lifetime has no
+    effect on the model at all, M is exactly singular along that direction,
+    and the plain inverse turns the std of EVERY parameter into NaN -- about
+    a third of dim biexponential pixels. Dropping the dead parameter gives
+    the remaining ones their proper (single-component) uncertainty, while
+    the dead lifetime itself is reported as NaN (unidentifiable), not as a
+    confident-looking number.
+
+    The inverse is computed on the diagonally rescaled matrix
+    D^-1/2 M D^-1/2, so parameters whose curvature differs by many orders of
+    magnitude do not spoil its accuracy."""
+    d = np.diag(M)
+    alive = d > 1e-14 * np.max(d)
+    if not alive[k]:
+        return np.nan
+    M = M[np.ix_(alive, alive)]
+    k = int(np.sum(alive[:k]))
+    s = 1.0 / np.sqrt(np.diag(M))
+    return np.linalg.inv(M * s[:, None] * s[None, :])[k, k] * s[k] ** 2
+
+
+def _param_std_fisher(model, p_hat, idx, free=None, bounds=None, fallback=None):
+    """1-sigma uncertainty on parameter p_hat[idx] from the Poisson FISHER
+    INFORMATION, F_ij = sum_k (dm_k/dp_i)(dm_k/dp_j) / m_k, with the model
+    derivatives taken by central differences; sigma = sqrt([F^-1]_idx,idx).
+    This is the expected value of the Hessian that _param_std_full computes
+    by second differences, but needs only ~2n model evaluations instead of
+    ~2n^2 -- the difference between +5 % and +40 % run time per pixel for a
+    reconvolution fit -- and it accounts for the correlations between
+    parameters that the fixed-parameter shortcut (_param_std) ignores, which
+    made biexponential pixel uncertainties ~4x too small.
+
+    model(p) -> expected counts per bin. free / bounds: as in
+    _param_std_full (parameters on a bound are treated as fixed; if the
+    requested parameter itself is on a bound, fallback() is returned if
+    given, else NaN)."""
+    p = np.asarray(p_hat, dtype=float)
+    free = list(range(len(p))) if free is None else list(free)
+    if bounds is not None:
+        on_bound = [i for i, (lo, hi) in enumerate(bounds)
+                    if np.isclose(p[i], lo, rtol=1e-6, atol=1e-9) or np.isclose(p[i], hi, rtol=1e-6, atol=1e-9)]
+        if idx in on_bound:
+            return fallback() if fallback is not None else np.nan
+        free = [i for i in free if i not in on_bound]
+    try:
+        m = np.maximum(model(p), 1e-9)
+        J = np.empty((len(free), m.size))
+        for a, i in enumerate(free):
+            h = max(abs(p[i]) * 1e-3, 1e-4)
+            q = p.copy(); q[i] = p[i] + h; up = model(q)
+            q[i] = p[i] - h; dn = model(q)
+            J[a] = (up - dn) / (2 * h)
+        var = _inv_diag_entry((J / m) @ J.T, free.index(idx))
+    except Exception:
+        return np.nan
+    return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
+
+
 def _tail_axis(s, cube, offset=None):
     """Determine the peak, tail-start bin and the ns time axis for the tail.
     offset: bins after the peak where the tail fit starts (default:
@@ -105,7 +301,8 @@ def _tail_axis(s, cube, offset=None):
 
 
 def global_fit(summed, s, s_idx, tn, mono=False,
-              tau_short_bounds=None, tau_long_bounds=None, tau_mono_bounds=None):
+              tau_short_bounds=None, tau_long_bounds=None, tau_mono_bounds=None,
+              estimator="poisson", fit_background=True):
     """Robust tail fit of the summed decay (all pixels). mono=False (default)
     fits a biexponential; mono=True fits a single exponential -- appropriate
     when a mono-exponential model is a better description of the sample (a
@@ -116,9 +313,30 @@ def global_fit(summed, s, s_idx, tn, mono=False,
     the optimizer's search range for each lifetime -- pass None (default)
     to use the config.py default, or override per run/per dye.
 
+    estimator: "poisson" (default) fits the Poisson likelihood, the same
+    statistical model the per-pixel fits use. "leastsq" is the previous
+    behaviour: curve_fit weighted by sqrt(max(counts, 1)). That weighting
+    is estimated from the noisy data itself, which biases the lifetimes
+    LOW when the pooled curve has few photons (e.g. 6 ns read 5.7 ns at
+    20k photons, and a 2 + 6 ns biexponential came out 1.6 / 5.2 ns); the
+    bias vanishes at millions of photons. For the biexponential the
+    curve_fit result is kept as the SEED (robust at finding the right
+    neighbourhood) and then refined with the Poisson fit; if that fails,
+    the curve_fit result is returned with a warning.
+
+    fit_background: True (default) fits a constant background C together with
+    the decay. False holds C = 0 -- only correct for data that really contain
+    no background (e.g. a simulation, or time-gated data); on data WITH
+    background it biases the lifetimes (a missing constant is absorbed into a
+    too-long tau). Do not pre-subtract the background and then fit with
+    False: that leaves negative or non-integer counts, which the Poisson
+    likelihood cannot handle (the free C is the statistically sound way).
+
     The returned dict includes tau_std (mono) or tau_short_std/tau_long_std
-    (bi), from curve_fit's own covariance matrix -- a free byproduct of the
-    fit, previously computed and discarded."""
+    (bi): the full-Hessian estimate for "poisson", curve_fit's own
+    covariance matrix for "leastsq"."""
+    if estimator not in ("poisson", "leastsq"):
+        raise ValueError(f"estimator must be 'poisson' or 'leastsq', got {estimator!r}")
     tau_short_bounds, tau_long_bounds, tau_mono_bounds = _resolve_bounds(
         tau_short_bounds, tau_long_bounds, tau_mono_bounds)
     yv = summed[s_idx:].astype(float)      # tail portion of the summed (whole-image) decay
@@ -127,15 +345,26 @@ def global_fit(summed, s, s_idx, tn, mono=False,
         def model(t, A, tau, C):
             return A * np.exp(-t / tau) + C
 
-        p0 = [yv.max(), sum(tau_mono_bounds) / 2, yv.min() + 1]
-        popt, pcov = curve_fit(model, tn, yv, p0=p0,
-                            sigma=np.sqrt(np.maximum(yv, 1)),
-                            bounds=([0, tau_mono_bounds[0], 0],
-                                    [np.inf, tau_mono_bounds[1], np.inf]),
-                            maxfev=20000)
+        p0 = [yv.max(), sum(tau_mono_bounds) / 2, (yv.min() + 1) if fit_background else 0.0]
+        c_max = np.inf if fit_background else 0.0
+        free = [0, 1, 2] if fit_background else [0, 1]
+        if estimator == "poisson":
+            refined = _poisson_refine(model, tn, yv, p0,
+                                      [(0, np.inf), tuple(tau_mono_bounds), (0, c_max)])
+            if refined is not None:
+                popt, dev = refined
+                return dict(tau=popt[1], tau_std=_param_std_full(dev, popt, 1, free=free),
+                            popt=popt, model=model, yv=yv, mono=True, estimator="poisson",
+                            fit_background=fit_background)
+            warnings.warn("global_fit (mono): Poisson fit failed, using curve_fit result instead.",
+                          RuntimeWarning)
+        popt, pcov = _curve_fit_tail(model, tn, yv, p0,
+                                     [0, tau_mono_bounds[0], 0], [np.inf, tau_mono_bounds[1], np.inf],
+                                     fit_background)
         A, tau, C = popt
         return dict(tau=tau, tau_std=_curve_fit_std(pcov, 1),
-                    popt=popt, model=model, yv=yv, mono=True)
+                    popt=popt, model=model, yv=yv, mono=True, estimator="leastsq",
+                    fit_background=fit_background)
 
     def model(t, A1, t1, A2, t2, C):
         # Biexponential decay + constant background offset C.
@@ -143,22 +372,43 @@ def global_fit(summed, s, s_idx, tn, mono=False,
 
     # Initial guess: split the peak amplitude ~60/40 between a short and long
     # component, seed lifetimes in the middle of their expected ranges.
-    p0 = [yv.max() * 0.6, sum(tau_short_bounds) / 2, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
-    popt, pcov = curve_fit(model, tn, yv, p0=p0,
-                        sigma=np.sqrt(np.maximum(yv, 1)),   # approximate Poisson (shot-noise) weighting
-                        # Bounds pin t1 to the "short" range and t2 to the "long" range so
-                        # curve_fit can't swap/confuse the two components during the fit.
-                        bounds=([0, tau_short_bounds[0], 0, tau_short_bounds[1], 0],
-                                [np.inf, tau_short_bounds[1], np.inf, tau_long_bounds[1], np.inf]),
-                        maxfev=20000)
+    p0 = [yv.max() * 0.6, sum(tau_short_bounds) / 2, yv.max() * 0.4, sum(tau_long_bounds) / 2,
+          (yv.min() + 1) if fit_background else 0.0]
+    c_max = np.inf if fit_background else 0.0
+    free = [0, 1, 2, 3, 4] if fit_background else [0, 1, 2, 3]
+    # Bounds pin t1 to the "short" range and t2 to the "long" range so the fit
+    # can't swap/confuse the two components.
+    lo = [0, tau_short_bounds[0], 0, tau_long_bounds[0], 0]
+    hi = [np.inf, tau_short_bounds[1], np.inf, tau_long_bounds[1], np.inf]
+    try:
+        # sqrt(max(counts, 1)) weighting: approximate Poisson (shot-noise) weighting
+        popt, pcov = _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background)
+    except (RuntimeError, ValueError):
+        if estimator != "poisson":
+            raise
+        popt, pcov = np.array(p0, dtype=float), None      # curve_fit failed: seed the Poisson fit from p0
+    std_of = lambda i: _curve_fit_std(pcov, i)
+    used = "leastsq"
+    if estimator == "poisson":
+        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi[:-1] + [c_max])))
+        if refined is not None:
+            popt, dev = refined
+            std_of = lambda i: _param_std_full(dev, popt, i, free=free)
+            used = "poisson"
+        elif pcov is None:
+            raise RuntimeError("global_fit: both curve_fit and the Poisson fit failed.")
+        else:
+            warnings.warn("global_fit: Poisson refinement failed, using curve_fit result instead.",
+                          RuntimeWarning)
     A1, t1, A2, t2, C = popt
     # t1 is always the "short" range and t2 the "long" range (enforced by
     # the bounds above), so unlike the per-pixel free fit, no index-tracking
     # is needed to know which covariance entry belongs to which lifetime.
     ts, tl = sorted([t1, t2])   # tau_short = smaller lifetime, tau_long = larger, regardless of fit order
     return dict(tau_short=ts, tau_long=tl,
-               tau_short_std=_curve_fit_std(pcov, 1), tau_long_std=_curve_fit_std(pcov, 3),
-               popt=popt, model=model, yv=yv, mono=False)
+               tau_short_std=std_of(1), tau_long_std=std_of(3),
+               popt=popt, model=model, yv=yv, mono=False, estimator=used,
+               fit_background=fit_background)
 
 
 class AnalysisCancelled(Exception):
@@ -169,7 +419,8 @@ class AnalysisCancelled(Exception):
     pass
 
 
-def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=None):
+def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=None,
+                    fit_background=True):
     """Per-pixel mono-exponential tail fit on masked pixels (A, tau, C -- 3
     free parameters, half of the biexponential's 5).
 
@@ -180,7 +431,10 @@ def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=No
     cancel_check: optional zero-arg callable, checked once per pixel;
     raises AnalysisCancelled (with maps filled in so far discarded by the
     caller) if it returns True -- lets a GUI Stop button interrupt a long
-    per-pixel loop promptly instead of only between whole plugin runs."""
+    per-pixel loop promptly instead of only between whole plugin runs.
+
+    fit_background: True (default) fits a constant background C per pixel.
+    False holds C = 0 (only for data without background -- see global_fit)."""
     _, _, tau_mono_bounds = _resolve_bounds(None, None, tau_mono_bounds)
     H, W, _ = cube.shape
     tail = cube[:, :, s_idx:]
@@ -191,10 +445,12 @@ def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=No
     nll_map = np.full((H, W), np.nan)
     tau_seed = sum(tau_mono_bounds) / 2
 
-    def nll(p, k):
+    def model(p):
         A, tau, C = p
-        m = A * np.exp(-tn / tau) + C
-        m = np.maximum(m, 1e-9)
+        return A * np.exp(-tn / tau) + C
+
+    def nll(p, k):
+        m = np.maximum(model(p), 1e-9)
         return np.sum(m - k * np.log(m))
 
     ys, xs = np.where(mask)
@@ -205,12 +461,13 @@ def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=No
             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
         k = tail[i, j]
         pk = max(k[:5].mean(), 1.0)
-        bg = max(k[-20:].mean(), 0.5)
+        bg = max(k[-20:].mean(), 0.5) if fit_background else 0.0
         p0 = [pk, tau_seed, bg]
-        bnds = [(0, pk * 6), tau_mono_bounds, (0, pk)]
+        bnds = [(0, pk * 6), tau_mono_bounds, (0, pk if fit_background else 0.0)]
         r = minimize(nll, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
         tau_map[i, j] = r.x[1]
-        tau_std_map[i, j] = _param_std(nll, r.x, 1, args=(k,))
+        tau_std_map[i, j] = _param_std_fisher(model, r.x, 1, bounds=bnds,
+                                               fallback=lambda: _param_std(nll, r.x, 1, args=(k,)))
         n_photons_map[i, j] = k.sum()
         converged_map[i, j] = bool(r.success)
         nll_map[i, j] = r.fun
@@ -221,7 +478,8 @@ def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=No
 
 
 def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
-               tau_short_bounds=None, tau_long_bounds=None, cancel_check=None):
+               tau_short_bounds=None, tau_long_bounds=None, cancel_check=None,
+               fit_background=True):
     """
     Per-pixel biexponential tail fit on masked pixels.
       tau_short_fixed=None -> both lifetimes float (free biexponential)
@@ -232,6 +490,7 @@ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
       tau_long, tau_short, tau_long_std, tau_short_std, n_photons, converged, nll
 
     cancel_check: see fit_pixels_mono -- same optional per-pixel interrupt.
+    fit_background: see fit_pixels_mono -- False holds the per-pixel C = 0.
     """
     tau_short_bounds, tau_long_bounds, _ = _resolve_bounds(tau_short_bounds, tau_long_bounds, None)
     H, W, _ = cube.shape
@@ -246,16 +505,20 @@ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
     ts_seed = sum(tau_short_bounds) / 2
     tl_seed = sum(tau_long_bounds) / 2
 
-    def nll_free(p, k):
+    def model_free(p):
         A1, t1, A2, t2, C = p
-        m = A1 * np.exp(-tn / t1) + A2 * np.exp(-tn / t2) + C
-        m = np.maximum(m, 1e-9)
+        return A1 * np.exp(-tn / t1) + A2 * np.exp(-tn / t2) + C
+
+    def model_fixed(p):
+        A1, A2, t2, C = p
+        return A1 * np.exp(-tn / tau_short_fixed) + A2 * np.exp(-tn / t2) + C
+
+    def nll_free(p, k):
+        m = np.maximum(model_free(p), 1e-9)
         return np.sum(m - k * np.log(m))
 
     def nll_fixed(p, k):
-        A1, A2, t2, C = p
-        m = A1 * np.exp(-tn / tau_short_fixed) + A2 * np.exp(-tn / t2) + C
-        m = np.maximum(m, 1e-9)
+        m = np.maximum(model_fixed(p), 1e-9)
         return np.sum(m - k * np.log(m))
 
     ys, xs = np.where(mask)
@@ -266,10 +529,11 @@ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
         k = tail[i, j]
         pk = max(k[:5].mean(), 1.0)
-        bg = max(k[-20:].mean(), 0.5)
+        bg = max(k[-20:].mean(), 0.5) if fit_background else 0.0
+        c_max = pk if fit_background else 0.0
         if tau_short_fixed is None:
             p0 = [pk * 0.6, ts_seed, pk * 0.4, tl_seed, bg]
-            bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, pk)]
+            bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, c_max)]
             r = minimize(nll_free, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
             t1, t2 = r.x[1], r.x[3]
             # Track which parameter INDEX ended up holding the short vs long
@@ -277,15 +541,18 @@ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
             # the right covariance-index gets the right std.
             idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
             tau_short[i, j], tau_long[i, j] = sorted([t1, t2])
-            tau_short_std[i, j] = _param_std(nll_free, r.x, idx_short, args=(k,))
-            tau_long_std[i, j] = _param_std(nll_free, r.x, idx_long, args=(k,))
+            tau_short_std[i, j] = _param_std_fisher(model_free, r.x, idx_short, bounds=bnds,
+                                                    fallback=lambda: _param_std(nll_free, r.x, idx_short, args=(k,)))
+            tau_long_std[i, j] = _param_std_fisher(model_free, r.x, idx_long, bounds=bnds,
+                                                   fallback=lambda: _param_std(nll_free, r.x, idx_long, args=(k,)))
         else:
             p0 = [pk * 0.6, pk * 0.4, tl_seed, bg]
-            bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, pk)]
+            bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, c_max)]
             r = minimize(nll_fixed, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
             tau_short[i, j] = tau_short_fixed
             tau_long[i, j]  = r.x[2]
-            tau_long_std[i, j] = _param_std(nll_fixed, r.x, 2, args=(k,))
+            tau_long_std[i, j] = _param_std_fisher(model_fixed, r.x, 2, bounds=bnds,
+                                                   fallback=lambda: _param_std(nll_fixed, r.x, 2, args=(k,)))
         n_photons_map[i, j] = k.sum()
         converged_map[i, j] = bool(r.success)
         nll_map[i, j] = r.fun
@@ -296,7 +563,7 @@ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
                n_photons=n_photons_map, converged=converged_map, nll=nll_map)
 
 
-def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True):
+def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True, correct_bias=True):
     """Photon-weighted mean arrival time (the decay's first moment) of
     every masked pixel's tail -- a fast, non-iterative alternative to
     exponential fitting:
@@ -318,6 +585,20 @@ def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True):
     exponential fits use) before computing the moment -- background counts
     that aren't part of the real decay would otherwise bias the mean toward
     later times.
+
+    correct_bias=True (default) removes two small systematic errors, both of
+    which pull the result LOW (about 3-4 % for a 6 ns decay, 1-2 % for 2 ns):
+      * the cutoff below discards the last ~0.5 % of the pooled signal. That
+        is the LATEST light, so it carries a large time-weight and its loss
+        lowers the mean (5.75 instead of 5.95 ns for a 6 ns decay). The
+        missing part is extrapolated from the pooled curve's own tail
+        (_tail_extrapolation) and scaled for each pixel by that pixel's share
+        of the late signal, so a short-lived pixel in the same mask is not
+        over-corrected. Skipped when the tail cannot be extrapolated
+        reliably (too few counts, or the decay is far from finished).
+      * times are taken at bin CENTRES instead of left edges (+half a bin,
+        0.025 ns at 50 ps).
+    False reproduces the previous numbers.
 
     Also returns the standard error of the mean -- exact, not an
     approximation, for a weighted-mean estimator:
@@ -383,16 +664,32 @@ def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True):
 
     pooled = tail[mask].sum(axis=0) if mask.any() else tail.sum(axis=(0, 1))
     cutoff = _tail_signal_cutoff(pooled)
+    ext = _tail_extrapolation(pooled, cutoff) if correct_bias else None
+    dt = float(tn[1] - tn[0]) if len(tn) > 1 else 0.0
     tail = tail[:, :, :cutoff]
     tn = tn[:cutoff]
+    if correct_bias:
+        tn = tn + 0.5 * dt             # bin centres, not left edges
 
     n_photons_raw = tail.sum(axis=2)   # [H, W] -- may be slightly negative for a
                                         # pixel with ~no real signal above an
                                         # over-subtracted background estimate.
 
     with np.errstate(invalid="ignore", divide="ignore"):
-        tau_mean_map = np.tensordot(tail, tn, axes=([2], [0])) / n_photons_raw
-        deviation_sq = (tn[None, None, :] - tau_mean_map[:, :, None]) ** 2
+        weighted_sum = np.tensordot(tail, tn, axes=([2], [0]))
+        tau_trunc = weighted_sum / n_photons_raw     # mean over the kept window
+        if ext is not None:
+            # Each pixel's own share of the late (pre-cutoff) signal scales the
+            # extrapolated missing tail: no late light -> no correction.
+            share = tail[:, :, cutoff - ext["share_len"]:cutoff].sum(axis=2) / ext["s_share"]   # NOT clipped: noise stays zero-mean
+            missing_n = share * ext["n_ext"]
+            missing_t = share * dt * (ext["m_ext"] + 0.5 * ext["n_ext"])    # sum(time * counts), ns
+            tau_mean_map = (weighted_sum + missing_t) / (n_photons_raw + missing_n)
+        else:
+            tau_mean_map = tau_trunc
+        # the SEM describes the spread of the photons actually observed, i.e.
+        # around the mean of the kept window
+        deviation_sq = (tn[None, None, :] - tau_trunc[:, :, None]) ** 2
         var_t = np.sum(tail * deviation_sq, axis=2) / n_photons_raw
         # var_t is a sum of SIGNED terms (unclipped tail * a squared, always
         # non-negative, distance), not a true sum-of-squares, so it can come
@@ -453,3 +750,52 @@ def _tail_signal_cutoff(pooled_bs, min_fraction=0.995, min_bins=20):
     cum = np.cumsum(clipped)
     idx = int(np.searchsorted(cum, min_fraction * total)) + 1
     return max(min(idx, n), min(min_bins, n))
+
+
+def _tail_extrapolation(pooled_bs, cutoff, min_block_counts=100.0, max_missing=0.05):
+    """Estimate the signal that the cutoff throws away, by extrapolating the
+    pooled background-subtracted curve beyond `cutoff` as a single
+    exponential. Its decay constant comes from the ratio of the summed signal
+    in the last two equal blocks (h bins each) before the cutoff, which is
+    robust to the negative residuals the background subtraction leaves.
+
+    Returns a dict, in units of counts and bin index counted from the start
+    of `pooled_bs`:
+      n_ext    the missing counts (sum from the cutoff to infinity)
+      m_ext    their first moment, sum(index * counts)
+      share_len, s_share  length of the window just before the cutoff and the
+               pooled signal in it; each pixel scales the correction by ITS
+               OWN share of that window, so a pixel that has no late light
+               is not corrected at all
+    or None when no reliable extrapolation exists: fewer than
+    min_block_counts counts in the block (the decay constant would be noise;
+    100 counts keeps its relative error near 15 %, and the correction itself
+    is only ~3 % of tau), a curve that is not decaying there, or an
+    estimated missing share above max_missing (a normal 99.5 % cutoff
+    misses ~0.5 %; much more means the decay is far from finished in the
+    window, and a longer window is the fix, not an extrapolation)."""
+    c = int(cutoff)
+    h = max(10, c // 5)
+    if c < 2 * h:
+        return None
+    s1 = float(pooled_bs[c - 2 * h:c - h].sum())
+    s2 = float(pooled_bs[c - h:c].sum())
+    if s2 < min_block_counts or s1 <= s2:
+        return None
+    q = (s2 / s1) ** (1.0 / h)                      # per-bin decay ratio, 0 < q < 1
+    if not (0.0 < q < 1.0):
+        return None
+    peak_at_c = s2 / np.sum(q ** -np.arange(1, h + 1))   # fitted signal in the first excluded bin
+    n_ext = peak_at_c / (1.0 - q)
+    m_ext = peak_at_c * (c / (1.0 - q) + q / (1.0 - q) ** 2)
+    n_in = float(np.clip(pooled_bs[:c], 0, None).sum())
+    if n_in <= 0 or n_ext / n_in > max_missing:
+        return None
+    # Window over which each pixel's share of the late signal is measured: 3
+    # blocks, because a pixel's share from one short block is dominated by
+    # shot noise, and that noise is correlated with the pixel's own moment
+    # (the same late photons feed both), which inflated the per-pixel scatter
+    # by ~25 %; the wider window brings that down to ~7 %.
+    share_len = min(3 * h, c)
+    return dict(n_ext=n_ext, m_ext=m_ext, share_len=share_len,
+                s_share=float(pooled_bs[c - share_len:c].sum()))

@@ -1,0 +1,352 @@
+--- a/flim_core/fitting.py	2026-11-04 09:52:48.786488598 +0000
++++ b/flim_core/fitting.py	2026-11-04 09:52:48.792475788 +0000
+@@ -30,6 +30,8 @@
+ single-number tau_std/tau_short_std/tau_long_std in their returned dict.
+ """
+ 
++import warnings
++
+ import numpy as np
+ from scipy.optimize import minimize, curve_fit
+ 
+@@ -89,6 +91,97 @@
+     return float(np.sqrt(var)) if var > 0 else np.nan
+ 
+ 
++def _poisson_fit(model, yv, p0, bounds, ftol=1e-12, gtol=1e-8, maxiter=2000):
++    """Poisson maximum-likelihood fit of model(params) to the counts yv with
++    L-BFGS-B, written to stay accurate at HIGH photon counts.
++
++    Why not minimize sum(m - y*log(m)) directly: that objective carries a huge
++    constant offset (about 4e7 at a few million photons) and the parameters
++    differ in size by orders of magnitude (A ~ 1e5, tau ~ 6, C ~ 40).
++    L-BFGS-B's relative stopping rule and its finite-difference gradient then
++    declare convergence well short of the optimum -- tau came out 3-7 % too
++    long on exact synthetic data (6.17 ns for a 6 ns decay). Two changes
++    remove that, without changing the optimum:
++
++      * the objective is the Poisson deviance  sum(m - y + y*log(y/m)),
++        i.e. the same likelihood minus a constant, so its value is ~O(nbins)
++        instead of ~O(photons);
++      * every parameter is divided by its starting value, so the optimizer
++        works on O(1) numbers (bounds are rescaled the same way).
++
++    Returns (params in the ORIGINAL units, objective(params in original
++    units)). The objective has the same curvature as the negative
++    log-likelihood, so it can be passed straight to _param_std /
++    _param_std_full."""
++    yv = np.asarray(yv, dtype=float)
++    pos = yv > 0
++    y_safe = np.where(pos, yv, 1.0)
++    p0 = np.asarray(p0, dtype=float)
++    scale = np.where(np.abs(p0) > 1e-6, np.abs(p0), 1.0)
++
++    def dev(p):
++        m = np.maximum(model(p), 1e-9)
++        return np.sum(m - yv + np.where(pos, yv * np.log(y_safe / m), 0.0))
++
++    z_bounds = [(lo / s, hi / s) for (lo, hi), s in zip(bounds, scale)]
++    r = minimize(lambda z: dev(z * scale), p0 / scale, method="L-BFGS-B",
++                 bounds=z_bounds, options=dict(ftol=ftol, gtol=gtol, maxiter=maxiter))
++    return r.x * scale, dev
++
++
++def _poisson_refine(model, tn, yv, p_seed, bounds):
++    """Poisson ML refinement of a tail-fit model(t, *params), starting from
++    p_seed (e.g. a curve_fit result). Returns (popt, objective) or None if
++    the refinement failed (exception, non-finite result), so callers can fall
++    back to the seed instead of aborting a long run. Never returns a point
++    with a worse Poisson deviance than the seed."""
++    try:
++        seed = np.asarray(p_seed, dtype=float)
++        x, dev = _poisson_fit(lambda p: model(tn, *p), yv, seed, bounds)
++        d_new, d_seed = dev(x), dev(seed)
++        if not (np.all(np.isfinite(x)) and np.isfinite(d_new)):
++            return None
++        if np.isfinite(d_seed) and d_new > d_seed:
++            x = seed
++        return x, dev
++    except Exception:
++        return None
++
++
++def _param_std_full(nll_func, p_hat, idx, args=()):
++    """1-sigma uncertainty on parameter p_hat[idx] from the FULL numerical
++    Hessian of nll_func at the fit (central differences, all parameters
++    free): sigma = sqrt([H^-1]_idx,idx). Unlike _param_std, which holds the
++    other parameters fixed, this accounts for their correlations -- for a
++    biexponential the two lifetimes and amplitudes are strongly correlated,
++    and the fixed-parameter shortcut underestimates the error about 3-4x
++    (tested against the scatter of repeated fits). Costs ~n^2 evaluations,
++    fine for a one-off pooled fit; too slow to run per pixel. Returns NaN if
++    the Hessian isn't usable."""
++    p = np.asarray(p_hat, dtype=float)
++    n = len(p)
++    h = np.maximum(np.abs(p) * 0.01, 1e-4)
++    H = np.zeros((n, n))
++
++    def f(i, a, j, b):
++        q = p.copy()
++        q[i] += a * h[i]
++        q[j] += b * h[j]
++        return nll_func(q, *args)
++
++    try:
++        f0 = nll_func(p, *args)
++        for i in range(n):
++            H[i, i] = (f(i, 1, i, 0) - 2 * f0 + f(i, -1, i, 0)) / h[i] ** 2
++            for j in range(i + 1, n):
++                H[i, j] = H[j, i] = (f(i, 1, j, 1) - f(i, 1, j, -1)
++                                     - f(i, -1, j, 1) + f(i, -1, j, -1)) / (4 * h[i] * h[j])
++        var = np.linalg.inv(H)[idx, idx]
++    except Exception:
++        return np.nan
++    return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
++
++
+ def _tail_axis(s, cube, offset=None):
+     """Determine the peak, tail-start bin and the ns time axis for the tail.
+     offset: bins after the peak where the tail fit starts (default:
+@@ -105,7 +198,8 @@
+ 
+ 
+ def global_fit(summed, s, s_idx, tn, mono=False,
+-              tau_short_bounds=None, tau_long_bounds=None, tau_mono_bounds=None):
++              tau_short_bounds=None, tau_long_bounds=None, tau_mono_bounds=None,
++              estimator="poisson"):
+     """Robust tail fit of the summed decay (all pixels). mono=False (default)
+     fits a biexponential; mono=True fits a single exponential -- appropriate
+     when a mono-exponential model is a better description of the sample (a
+@@ -116,9 +210,22 @@
+     the optimizer's search range for each lifetime -- pass None (default)
+     to use the config.py default, or override per run/per dye.
+ 
++    estimator: "poisson" (default) fits the Poisson likelihood, the same
++    statistical model the per-pixel fits use. "leastsq" is the previous
++    behaviour: curve_fit weighted by sqrt(max(counts, 1)). That weighting
++    is estimated from the noisy data itself, which biases the lifetimes
++    LOW when the pooled curve has few photons (e.g. 6 ns read 5.7 ns at
++    20k photons, and a 2 + 6 ns biexponential came out 1.6 / 5.2 ns); the
++    bias vanishes at millions of photons. For the biexponential the
++    curve_fit result is kept as the SEED (robust at finding the right
++    neighbourhood) and then refined with the Poisson fit; if that fails,
++    the curve_fit result is returned with a warning.
++
+     The returned dict includes tau_std (mono) or tau_short_std/tau_long_std
+-    (bi), from curve_fit's own covariance matrix -- a free byproduct of the
+-    fit, previously computed and discarded."""
++    (bi): the full-Hessian estimate for "poisson", curve_fit's own
++    covariance matrix for "leastsq"."""
++    if estimator not in ("poisson", "leastsq"):
++        raise ValueError(f"estimator must be 'poisson' or 'leastsq', got {estimator!r}")
+     tau_short_bounds, tau_long_bounds, tau_mono_bounds = _resolve_bounds(
+         tau_short_bounds, tau_long_bounds, tau_mono_bounds)
+     yv = summed[s_idx:].astype(float)      # tail portion of the summed (whole-image) decay
+@@ -128,6 +235,15 @@
+             return A * np.exp(-t / tau) + C
+ 
+         p0 = [yv.max(), sum(tau_mono_bounds) / 2, yv.min() + 1]
++        if estimator == "poisson":
++            refined = _poisson_refine(model, tn, yv, p0,
++                                      [(0, np.inf), tuple(tau_mono_bounds), (0, np.inf)])
++            if refined is not None:
++                popt, dev = refined
++                return dict(tau=popt[1], tau_std=_param_std_full(dev, popt, 1),
++                            popt=popt, model=model, yv=yv, mono=True, estimator="poisson")
++            warnings.warn("global_fit (mono): Poisson fit failed, using curve_fit result instead.",
++                          RuntimeWarning)
+         popt, pcov = curve_fit(model, tn, yv, p0=p0,
+                             sigma=np.sqrt(np.maximum(yv, 1)),
+                             bounds=([0, tau_mono_bounds[0], 0],
+@@ -135,7 +251,7 @@
+                             maxfev=20000)
+         A, tau, C = popt
+         return dict(tau=tau, tau_std=_curve_fit_std(pcov, 1),
+-                    popt=popt, model=model, yv=yv, mono=True)
++                    popt=popt, model=model, yv=yv, mono=True, estimator="leastsq")
+ 
+     def model(t, A1, t1, A2, t2, C):
+         # Biexponential decay + constant background offset C.
+@@ -144,21 +260,41 @@
+     # Initial guess: split the peak amplitude ~60/40 between a short and long
+     # component, seed lifetimes in the middle of their expected ranges.
+     p0 = [yv.max() * 0.6, sum(tau_short_bounds) / 2, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
+-    popt, pcov = curve_fit(model, tn, yv, p0=p0,
+-                        sigma=np.sqrt(np.maximum(yv, 1)),   # approximate Poisson (shot-noise) weighting
+-                        # Bounds pin t1 to the "short" range and t2 to the "long" range so
+-                        # curve_fit can't swap/confuse the two components during the fit.
+-                        bounds=([0, tau_short_bounds[0], 0, tau_short_bounds[1], 0],
+-                                [np.inf, tau_short_bounds[1], np.inf, tau_long_bounds[1], np.inf]),
+-                        maxfev=20000)
++    lo = [0, tau_short_bounds[0], 0, tau_short_bounds[1], 0]
++    hi = [np.inf, tau_short_bounds[1], np.inf, tau_long_bounds[1], np.inf]
++    # NOTE: t2's lower bound is tau_short_bounds[1], not tau_long_bounds[0]
++    # (unchanged from before; identical with the default config values).
++    try:
++        popt, pcov = curve_fit(model, tn, yv, p0=p0,
++                            sigma=np.sqrt(np.maximum(yv, 1)),   # approximate Poisson (shot-noise) weighting
++                            # Bounds pin t1 to the "short" range and t2 to the "long" range so
++                            # curve_fit can't swap/confuse the two components during the fit.
++                            bounds=(lo, hi), maxfev=20000)
++    except (RuntimeError, ValueError):
++        if estimator != "poisson":
++            raise
++        popt, pcov = np.array(p0, dtype=float), None      # curve_fit failed: seed the Poisson fit from p0
++    std_of = lambda i: _curve_fit_std(pcov, i)
++    used = "leastsq"
++    if estimator == "poisson":
++        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi)))
++        if refined is not None:
++            popt, dev = refined
++            std_of = lambda i: _param_std_full(dev, popt, i)
++            used = "poisson"
++        elif pcov is None:
++            raise RuntimeError("global_fit: both curve_fit and the Poisson fit failed.")
++        else:
++            warnings.warn("global_fit: Poisson refinement failed, using curve_fit result instead.",
++                          RuntimeWarning)
+     A1, t1, A2, t2, C = popt
+     # t1 is always the "short" range and t2 the "long" range (enforced by
+     # the bounds above), so unlike the per-pixel free fit, no index-tracking
+     # is needed to know which covariance entry belongs to which lifetime.
+     ts, tl = sorted([t1, t2])   # tau_short = smaller lifetime, tau_long = larger, regardless of fit order
+     return dict(tau_short=ts, tau_long=tl,
+-               tau_short_std=_curve_fit_std(pcov, 1), tau_long_std=_curve_fit_std(pcov, 3),
+-               popt=popt, model=model, yv=yv, mono=False)
++               tau_short_std=std_of(1), tau_long_std=std_of(3),
++               popt=popt, model=model, yv=yv, mono=False, estimator=used)
+ 
+ 
+ class AnalysisCancelled(Exception):
+--- a/flim_core/irf.py	2026-11-04 09:52:48.788456970 +0000
++++ b/flim_core/irf.py	2026-11-04 09:52:48.794403436 +0000
+@@ -15,7 +15,7 @@
+ 
+ from .config import IRF_SHIFT_SEARCH, TAU_SHORT_BOUNDS, TAU_LONG_BOUNDS, TAU_MONO_BOUNDS
+ from .io import load_flim_data, build_decay_cube
+-from .fitting import _resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff
++from .fitting import _resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff, _poisson_fit
+ 
+ 
+ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
+@@ -322,43 +322,6 @@
+     return model
+ 
+ 
+-def _poisson_fit(model, yv, p0, bounds, ftol=1e-12, gtol=1e-8, maxiter=2000):
+-    """Poisson maximum-likelihood fit of model(params) to the counts yv with
+-    L-BFGS-B, written to stay accurate at HIGH photon counts.
+-
+-    Why not minimize sum(m - y*log(m)) directly (what the global fits did
+-    before): that objective carries a huge constant offset (about 4e7 at a few
+-    million photons) and the parameters differ in size by orders of magnitude
+-    (A ~ 1e5, tau ~ 6, C ~ 40). L-BFGS-B's relative stopping rule and its
+-    finite-difference gradient then declare convergence well short of the
+-    optimum -- tau came out 3-7 % too long on exact synthetic data (6.17 ns
+-    for a 6 ns decay). Two changes remove that, without changing the optimum:
+-
+-      * the objective is the Poisson deviance  sum(m - y + y*log(y/m)),
+-        i.e. the same likelihood minus a constant, so its value is ~O(nbins)
+-        instead of ~O(photons);
+-      * every parameter is divided by its starting value, so the optimizer
+-        works on O(1) numbers (bounds are rescaled the same way).
+-
+-    Returns (params in the ORIGINAL units, objective(params in original
+-    units)). The objective has the same curvature as the negative
+-    log-likelihood, so it can be passed straight to _param_std."""
+-    yv = np.asarray(yv, dtype=float)
+-    pos = yv > 0
+-    y_safe = np.where(pos, yv, 1.0)
+-    p0 = np.asarray(p0, dtype=float)
+-    scale = np.where(np.abs(p0) > 1e-6, np.abs(p0), 1.0)
+-
+-    def dev(p):
+-        m = np.maximum(model(p), 1e-9)
+-        return np.sum(m - yv + np.where(pos, yv * np.log(y_safe / m), 0.0))
+-
+-    z_bounds = [(lo / s, hi / s) for (lo, hi), s in zip(bounds, scale)]
+-    r = minimize(lambda z: dev(z * scale), p0 / scale, method="L-BFGS-B",
+-                 bounds=z_bounds, options=dict(ftol=ftol, gtol=gtol, maxiter=maxiter))
+-    return r.x * scale, dev
+-
+-
+ def global_reconv_fit_mono(data_summed, irf_norm, tpb_ns, tau_mono_bounds=None, no_shift=False):
+     """Mono-exponential reconvolution fit of the whole-image (or masked-only)
+     summed decay -- reference/sanity-check fit, and available for --mono.
+--- a/analyses/_common.py	2026-11-04 09:52:48.790488289 +0000
++++ b/analyses/_common.py	2026-11-04 09:52:48.796730988 +0000
+@@ -20,7 +20,10 @@
+     clean_mask, bin_cube, bin_time_cube, moving_average_cube, report_dead_pixels,
+ )
+ from flim_core.config import TAIL_START_OFFSET
+-from flim_core.fitting import _tail_axis, global_fit, fit_pixels, fit_pixels_mono, _resolve_bounds, _curve_fit_std, mean_arrival_time
++from flim_core.fitting import (
++    _tail_axis, global_fit, fit_pixels, fit_pixels_mono, _resolve_bounds, _curve_fit_std,
++    mean_arrival_time, _poisson_refine, _param_std_full,
++)
+ from flim_core.plotting import plot_overview_and_mask, plot_results, plot_fit_quality
+ from flim_core.irf import (
+     global_reconv_fit, global_reconv_fit_mono, global_reconv_fit_fixed_short,
+@@ -555,13 +558,21 @@
+     return dict(group=g_idx, median=summary_val, iqr=summary_iqr, n_pixels=int(mask.sum()))
+ 
+ 
+-def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None):
++def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None,
++                           estimator="poisson"):
+     """Tail fit with tau_short pinned to a known value; only tau_long floats.
+     global_fit() itself has no fixed-tau_short mode (that's only offered for
+     the main script's per-pixel fit_pixels, since a global/pooled fit
+     normally has plenty of photons for a free fit already) -- but a single
+     time window here can still be photon-limited for a short --step, so this
+-    mirrors that same stabilization for the pooled-curve fit."""
++    mirrors that same stabilization for the pooled-curve fit.
++
++    estimator: "poisson" (default) or "leastsq" -- same meaning as in
++    flim_core.fitting.global_fit: the weighted curve_fit result is the seed,
++    refined by a Poisson fit (the weighted fit alone is biased at low
++    photon counts); "leastsq" returns the curve_fit result as before."""
++    if estimator not in ("poisson", "leastsq"):
++        raise ValueError(f"estimator must be 'poisson' or 'leastsq', got {estimator!r}")
+     _, tau_long_bounds, _ = _resolve_bounds(None, tau_long_bounds, None)
+     yv = summed[s_idx:].astype(float)
+ 
+@@ -569,13 +580,32 @@
+         return A1 * np.exp(-t / tau_short_fixed) + A2 * np.exp(-t / t2) + C
+ 
+     p0 = [yv.max() * 0.6, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
+-    popt, pcov = curve_fit(model, tn, yv, p0=p0, sigma=np.sqrt(np.maximum(yv, 1)),
+-                        bounds=([0, 0, tau_long_bounds[0], 0],
+-                                [np.inf, np.inf, tau_long_bounds[1], np.inf]),
+-                        maxfev=20000)
++    lo = [0, 0, tau_long_bounds[0], 0]
++    hi = [np.inf, np.inf, tau_long_bounds[1], np.inf]
++    try:
++        popt, pcov = curve_fit(model, tn, yv, p0=p0, sigma=np.sqrt(np.maximum(yv, 1)),
++                               bounds=(lo, hi), maxfev=20000)
++    except (RuntimeError, ValueError):
++        if estimator != "poisson":
++            raise
++        popt, pcov = np.array(p0, dtype=float), None
++    std_of = lambda i: _curve_fit_std(pcov, i)
++    used = "leastsq"
++    if estimator == "poisson":
++        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi)))
++        if refined is not None:
++            popt, dev = refined
++            std_of = lambda i: _param_std_full(dev, popt, i)
++            used = "poisson"
++        elif pcov is None:
++            raise RuntimeError("global_fit_fixed_short: both curve_fit and the Poisson fit failed.")
++        else:
++            import warnings
++            warnings.warn("global_fit_fixed_short: Poisson refinement failed, using curve_fit result instead.",
++                          RuntimeWarning)
+     A1, A2, t2, C = popt
+-    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_curve_fit_std(pcov, 2),
+-               popt=popt, model=model, yv=yv, mono=False)
++    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=std_of(2),
++               popt=popt, model=model, yv=yv, mono=False, estimator=used)
+ 
+ 
+ def fit_window_sum(cube, mask, s_like, mono, tau_short_fixed=None, offset=None,

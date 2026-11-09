@@ -1,0 +1,330 @@
+--- a/flim_core/fitting.py	2026-11-04 10:09:25.824494196 +0000
++++ b/flim_core/fitting.py	2026-11-04 10:09:25.826685063 +0000
+@@ -148,7 +148,7 @@
+         return None
+ 
+ 
+-def _param_std_full(nll_func, p_hat, idx, args=()):
++def _param_std_full(nll_func, p_hat, idx, args=(), free=None):
+     """1-sigma uncertainty on parameter p_hat[idx] from the FULL numerical
+     Hessian of nll_func at the fit (central differences, all parameters
+     free): sigma = sqrt([H^-1]_idx,idx). Unlike _param_std, which holds the
+@@ -157,9 +157,15 @@
+     and the fixed-parameter shortcut underestimates the error about 3-4x
+     (tested against the scatter of repeated fits). Costs ~n^2 evaluations,
+     fine for a one-off pooled fit; too slow to run per pixel. Returns NaN if
+-    the Hessian isn't usable."""
++    the Hessian isn't usable.
++
++    free: optional list of the parameter indices that were actually fitted.
++    Parameters held fixed (e.g. the background C when fit_background=False)
++    must be left out, otherwise their curvature would inflate the error of
++    the free ones as if they had been fitted too."""
+     p = np.asarray(p_hat, dtype=float)
+-    n = len(p)
++    free = list(range(len(p))) if free is None else list(free)
++    n = len(free)
+     h = np.maximum(np.abs(p) * 0.01, 1e-4)
+     H = np.zeros((n, n))
+ 
+@@ -171,17 +177,35 @@
+ 
+     try:
+         f0 = nll_func(p, *args)
+-        for i in range(n):
+-            H[i, i] = (f(i, 1, i, 0) - 2 * f0 + f(i, -1, i, 0)) / h[i] ** 2
+-            for j in range(i + 1, n):
+-                H[i, j] = H[j, i] = (f(i, 1, j, 1) - f(i, 1, j, -1)
+-                                     - f(i, -1, j, 1) + f(i, -1, j, -1)) / (4 * h[i] * h[j])
+-        var = np.linalg.inv(H)[idx, idx]
++        for ii, i in enumerate(free):
++            H[ii, ii] = (f(i, 1, i, 0) - 2 * f0 + f(i, -1, i, 0)) / h[i] ** 2
++            for jj in range(ii + 1, n):
++                j = free[jj]
++                H[ii, jj] = H[jj, ii] = (f(i, 1, j, 1) - f(i, 1, j, -1)
++                                         - f(i, -1, j, 1) + f(i, -1, j, -1)) / (4 * h[i] * h[j])
++        var = np.linalg.inv(H)[free.index(idx), free.index(idx)]
+     except Exception:
+         return np.nan
+     return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
+ 
+ 
++def _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background=True):
++    """curve_fit of a tail model whose LAST parameter is the background C,
++    weighted by sqrt(max(counts, 1)) like the original fits. With
++    fit_background=False, C is held at 0: the fit runs on the model without
++    C, and popt/pcov are padded back to full size (C = 0, zero covariance)
++    so callers see the same parameter layout either way."""
++    sigma = np.sqrt(np.maximum(yv, 1))
++    if fit_background:
++        return curve_fit(model, tn, yv, p0=p0, sigma=sigma, bounds=(lo, hi), maxfev=20000)
++    popt, pcov = curve_fit(lambda t, *q: model(t, *q, 0.0), tn, yv, p0=list(p0)[:-1], sigma=sigma,
++                           bounds=(list(lo)[:-1], list(hi)[:-1]), maxfev=20000)
++    n = len(popt) + 1
++    pcov_full = np.zeros((n, n))
++    pcov_full[:-1, :-1] = pcov
++    return np.append(popt, 0.0), pcov_full
++
++
+ def _tail_axis(s, cube, offset=None):
+     """Determine the peak, tail-start bin and the ns time axis for the tail.
+     offset: bins after the peak where the tail fit starts (default:
+@@ -199,7 +223,7 @@
+ 
+ def global_fit(summed, s, s_idx, tn, mono=False,
+               tau_short_bounds=None, tau_long_bounds=None, tau_mono_bounds=None,
+-              estimator="poisson"):
++              estimator="poisson", fit_background=True):
+     """Robust tail fit of the summed decay (all pixels). mono=False (default)
+     fits a biexponential; mono=True fits a single exponential -- appropriate
+     when a mono-exponential model is a better description of the sample (a
+@@ -221,6 +245,14 @@
+     neighbourhood) and then refined with the Poisson fit; if that fails,
+     the curve_fit result is returned with a warning.
+ 
++    fit_background: True (default) fits a constant background C together with
++    the decay. False holds C = 0 -- only correct for data that really contain
++    no background (e.g. a simulation, or time-gated data); on data WITH
++    background it biases the lifetimes (a missing constant is absorbed into a
++    too-long tau). Do not pre-subtract the background and then fit with
++    False: that leaves negative or non-integer counts, which the Poisson
++    likelihood cannot handle (the free C is the statistically sound way).
++
+     The returned dict includes tau_std (mono) or tau_short_std/tau_long_std
+     (bi): the full-Hessian estimate for "poisson", curve_fit's own
+     covariance matrix for "leastsq"."""
+@@ -234,24 +266,26 @@
+         def model(t, A, tau, C):
+             return A * np.exp(-t / tau) + C
+ 
+-        p0 = [yv.max(), sum(tau_mono_bounds) / 2, yv.min() + 1]
++        p0 = [yv.max(), sum(tau_mono_bounds) / 2, (yv.min() + 1) if fit_background else 0.0]
++        c_max = np.inf if fit_background else 0.0
++        free = [0, 1, 2] if fit_background else [0, 1]
+         if estimator == "poisson":
+             refined = _poisson_refine(model, tn, yv, p0,
+-                                      [(0, np.inf), tuple(tau_mono_bounds), (0, np.inf)])
++                                      [(0, np.inf), tuple(tau_mono_bounds), (0, c_max)])
+             if refined is not None:
+                 popt, dev = refined
+-                return dict(tau=popt[1], tau_std=_param_std_full(dev, popt, 1),
+-                            popt=popt, model=model, yv=yv, mono=True, estimator="poisson")
++                return dict(tau=popt[1], tau_std=_param_std_full(dev, popt, 1, free=free),
++                            popt=popt, model=model, yv=yv, mono=True, estimator="poisson",
++                            fit_background=fit_background)
+             warnings.warn("global_fit (mono): Poisson fit failed, using curve_fit result instead.",
+                           RuntimeWarning)
+-        popt, pcov = curve_fit(model, tn, yv, p0=p0,
+-                            sigma=np.sqrt(np.maximum(yv, 1)),
+-                            bounds=([0, tau_mono_bounds[0], 0],
+-                                    [np.inf, tau_mono_bounds[1], np.inf]),
+-                            maxfev=20000)
++        popt, pcov = _curve_fit_tail(model, tn, yv, p0,
++                                     [0, tau_mono_bounds[0], 0], [np.inf, tau_mono_bounds[1], np.inf],
++                                     fit_background)
+         A, tau, C = popt
+         return dict(tau=tau, tau_std=_curve_fit_std(pcov, 1),
+-                    popt=popt, model=model, yv=yv, mono=True, estimator="leastsq")
++                    popt=popt, model=model, yv=yv, mono=True, estimator="leastsq",
++                    fit_background=fit_background)
+ 
+     def model(t, A1, t1, A2, t2, C):
+         # Biexponential decay + constant background offset C.
+@@ -259,17 +293,17 @@
+ 
+     # Initial guess: split the peak amplitude ~60/40 between a short and long
+     # component, seed lifetimes in the middle of their expected ranges.
+-    p0 = [yv.max() * 0.6, sum(tau_short_bounds) / 2, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
+-    lo = [0, tau_short_bounds[0], 0, tau_short_bounds[1], 0]
++    p0 = [yv.max() * 0.6, sum(tau_short_bounds) / 2, yv.max() * 0.4, sum(tau_long_bounds) / 2,
++          (yv.min() + 1) if fit_background else 0.0]
++    c_max = np.inf if fit_background else 0.0
++    free = [0, 1, 2, 3, 4] if fit_background else [0, 1, 2, 3]
++    # Bounds pin t1 to the "short" range and t2 to the "long" range so the fit
++    # can't swap/confuse the two components.
++    lo = [0, tau_short_bounds[0], 0, tau_long_bounds[0], 0]
+     hi = [np.inf, tau_short_bounds[1], np.inf, tau_long_bounds[1], np.inf]
+-    # NOTE: t2's lower bound is tau_short_bounds[1], not tau_long_bounds[0]
+-    # (unchanged from before; identical with the default config values).
+     try:
+-        popt, pcov = curve_fit(model, tn, yv, p0=p0,
+-                            sigma=np.sqrt(np.maximum(yv, 1)),   # approximate Poisson (shot-noise) weighting
+-                            # Bounds pin t1 to the "short" range and t2 to the "long" range so
+-                            # curve_fit can't swap/confuse the two components during the fit.
+-                            bounds=(lo, hi), maxfev=20000)
++        # sqrt(max(counts, 1)) weighting: approximate Poisson (shot-noise) weighting
++        popt, pcov = _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background)
+     except (RuntimeError, ValueError):
+         if estimator != "poisson":
+             raise
+@@ -277,10 +311,10 @@
+     std_of = lambda i: _curve_fit_std(pcov, i)
+     used = "leastsq"
+     if estimator == "poisson":
+-        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi)))
++        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi[:-1] + [c_max])))
+         if refined is not None:
+             popt, dev = refined
+-            std_of = lambda i: _param_std_full(dev, popt, i)
++            std_of = lambda i: _param_std_full(dev, popt, i, free=free)
+             used = "poisson"
+         elif pcov is None:
+             raise RuntimeError("global_fit: both curve_fit and the Poisson fit failed.")
+@@ -294,7 +328,8 @@
+     ts, tl = sorted([t1, t2])   # tau_short = smaller lifetime, tau_long = larger, regardless of fit order
+     return dict(tau_short=ts, tau_long=tl,
+                tau_short_std=std_of(1), tau_long_std=std_of(3),
+-               popt=popt, model=model, yv=yv, mono=False, estimator=used)
++               popt=popt, model=model, yv=yv, mono=False, estimator=used,
++               fit_background=fit_background)
+ 
+ 
+ class AnalysisCancelled(Exception):
+@@ -305,7 +340,8 @@
+     pass
+ 
+ 
+-def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=None):
++def fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=None, cancel_check=None,
++                    fit_background=True):
+     """Per-pixel mono-exponential tail fit on masked pixels (A, tau, C -- 3
+     free parameters, half of the biexponential's 5).
+ 
+@@ -316,7 +352,10 @@
+     cancel_check: optional zero-arg callable, checked once per pixel;
+     raises AnalysisCancelled (with maps filled in so far discarded by the
+     caller) if it returns True -- lets a GUI Stop button interrupt a long
+-    per-pixel loop promptly instead of only between whole plugin runs."""
++    per-pixel loop promptly instead of only between whole plugin runs.
++
++    fit_background: True (default) fits a constant background C per pixel.
++    False holds C = 0 (only for data without background -- see global_fit)."""
+     _, _, tau_mono_bounds = _resolve_bounds(None, None, tau_mono_bounds)
+     H, W, _ = cube.shape
+     tail = cube[:, :, s_idx:]
+@@ -341,9 +380,9 @@
+             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
+         k = tail[i, j]
+         pk = max(k[:5].mean(), 1.0)
+-        bg = max(k[-20:].mean(), 0.5)
++        bg = max(k[-20:].mean(), 0.5) if fit_background else 0.0
+         p0 = [pk, tau_seed, bg]
+-        bnds = [(0, pk * 6), tau_mono_bounds, (0, pk)]
++        bnds = [(0, pk * 6), tau_mono_bounds, (0, pk if fit_background else 0.0)]
+         r = minimize(nll, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+         tau_map[i, j] = r.x[1]
+         tau_std_map[i, j] = _param_std(nll, r.x, 1, args=(k,))
+@@ -357,7 +396,8 @@
+ 
+ 
+ def fit_pixels(cube, s_idx, tn, mask, tau_short_fixed=None,
+-               tau_short_bounds=None, tau_long_bounds=None, cancel_check=None):
++               tau_short_bounds=None, tau_long_bounds=None, cancel_check=None,
++               fit_background=True):
+     """
+     Per-pixel biexponential tail fit on masked pixels.
+       tau_short_fixed=None -> both lifetimes float (free biexponential)
+@@ -368,6 +408,7 @@
+       tau_long, tau_short, tau_long_std, tau_short_std, n_photons, converged, nll
+ 
+     cancel_check: see fit_pixels_mono -- same optional per-pixel interrupt.
++    fit_background: see fit_pixels_mono -- False holds the per-pixel C = 0.
+     """
+     tau_short_bounds, tau_long_bounds, _ = _resolve_bounds(tau_short_bounds, tau_long_bounds, None)
+     H, W, _ = cube.shape
+@@ -402,10 +443,11 @@
+             raise AnalysisCancelled(f"Cancelled after {n}/{total} pixels.")
+         k = tail[i, j]
+         pk = max(k[:5].mean(), 1.0)
+-        bg = max(k[-20:].mean(), 0.5)
++        bg = max(k[-20:].mean(), 0.5) if fit_background else 0.0
++        c_max = pk if fit_background else 0.0
+         if tau_short_fixed is None:
+             p0 = [pk * 0.6, ts_seed, pk * 0.4, tl_seed, bg]
+-            bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, pk)]
++            bnds = [(0, pk * 6), tau_short_bounds, (0, pk * 6), tau_long_bounds, (0, c_max)]
+             r = minimize(nll_free, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+             t1, t2 = r.x[1], r.x[3]
+             # Track which parameter INDEX ended up holding the short vs long
+@@ -417,7 +459,7 @@
+             tau_long_std[i, j] = _param_std(nll_free, r.x, idx_long, args=(k,))
+         else:
+             p0 = [pk * 0.6, pk * 0.4, tl_seed, bg]
+-            bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, pk)]
++            bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, c_max)]
+             r = minimize(nll_fixed, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+             tau_short[i, j] = tau_short_fixed
+             tau_long[i, j]  = r.x[2]
+--- a/analyses/_common.py	2026-11-04 10:09:25.825569949 +0000
++++ b/analyses/_common.py	2026-11-04 10:09:25.827825131 +0000
+@@ -22,7 +22,7 @@
+ from flim_core.config import TAIL_START_OFFSET
+ from flim_core.fitting import (
+     _tail_axis, global_fit, fit_pixels, fit_pixels_mono, _resolve_bounds, _curve_fit_std,
+-    mean_arrival_time, _poisson_refine, _param_std_full,
++    mean_arrival_time, _poisson_refine, _param_std_full, _curve_fit_tail,
+ )
+ from flim_core.plotting import plot_overview_and_mask, plot_results, plot_fit_quality
+ from flim_core.irf import (
+@@ -559,7 +559,7 @@
+ 
+ 
+ def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None,
+-                           estimator="poisson"):
++                           estimator="poisson", fit_background=True):
+     """Tail fit with tau_short pinned to a known value; only tau_long floats.
+     global_fit() itself has no fixed-tau_short mode (that's only offered for
+     the main script's per-pixel fit_pixels, since a global/pooled fit
+@@ -570,7 +570,10 @@
+     estimator: "poisson" (default) or "leastsq" -- same meaning as in
+     flim_core.fitting.global_fit: the weighted curve_fit result is the seed,
+     refined by a Poisson fit (the weighted fit alone is biased at low
+-    photon counts); "leastsq" returns the curve_fit result as before."""
++    photon counts); "leastsq" returns the curve_fit result as before.
++
++    fit_background: True (default) fits a constant background C; False holds
++    C = 0 -- see flim_core.fitting.global_fit for when that is appropriate."""
+     if estimator not in ("poisson", "leastsq"):
+         raise ValueError(f"estimator must be 'poisson' or 'leastsq', got {estimator!r}")
+     _, tau_long_bounds, _ = _resolve_bounds(None, tau_long_bounds, None)
+@@ -579,12 +582,14 @@
+     def model(t, A1, A2, t2, C):
+         return A1 * np.exp(-t / tau_short_fixed) + A2 * np.exp(-t / t2) + C
+ 
+-    p0 = [yv.max() * 0.6, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
++    p0 = [yv.max() * 0.6, yv.max() * 0.4, sum(tau_long_bounds) / 2,
++          (yv.min() + 1) if fit_background else 0.0]
+     lo = [0, 0, tau_long_bounds[0], 0]
+     hi = [np.inf, np.inf, tau_long_bounds[1], np.inf]
++    c_max = np.inf if fit_background else 0.0
++    free = [0, 1, 2, 3] if fit_background else [0, 1, 2]
+     try:
+-        popt, pcov = curve_fit(model, tn, yv, p0=p0, sigma=np.sqrt(np.maximum(yv, 1)),
+-                               bounds=(lo, hi), maxfev=20000)
++        popt, pcov = _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background)
+     except (RuntimeError, ValueError):
+         if estimator != "poisson":
+             raise
+@@ -592,10 +597,10 @@
+     std_of = lambda i: _curve_fit_std(pcov, i)
+     used = "leastsq"
+     if estimator == "poisson":
+-        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi)))
++        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi[:-1] + [c_max])))
+         if refined is not None:
+             popt, dev = refined
+-            std_of = lambda i: _param_std_full(dev, popt, i)
++            std_of = lambda i: _param_std_full(dev, popt, i, free=free)
+             used = "poisson"
+         elif pcov is None:
+             raise RuntimeError("global_fit_fixed_short: both curve_fit and the Poisson fit failed.")
+@@ -605,7 +610,8 @@
+                           RuntimeWarning)
+     A1, A2, t2, C = popt
+     return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=std_of(2),
+-               popt=popt, model=model, yv=yv, mono=False, estimator=used)
++               popt=popt, model=model, yv=yv, mono=False, estimator=used,
++               fit_background=fit_background)
+ 
+ 
+ def fit_window_sum(cube, mask, s_like, mono, tau_short_fixed=None, offset=None,

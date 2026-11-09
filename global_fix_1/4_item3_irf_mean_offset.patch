@@ -1,0 +1,111 @@
+--- a/flim_core/irf.py	2026-11-04 10:25:25.256390299 +0000
++++ b/flim_core/irf.py	2026-11-04 10:25:25.257969816 +0000
+@@ -182,6 +182,7 @@
+     it to one leaves a systematic residual that the amplitude/tau
+     parameters can't compensate for (confirmed on real data: this alone
+     was enough to pin tau_short to its lower bound in every test)."""
++    shift = int(round(shift))   # fitted shifts are floats; this helper is integer-only
+     n = len(a)
+     out = np.zeros_like(a)
+     if shift == 0:
+@@ -234,6 +235,33 @@
+     return best_shift
+ 
+ 
++# The reconvolution models sample the exponential at the LEFT edge of each bin,
++# while the measured IRF counts are integrated across the bin. The two
++# conventions differ by half a bin, so a decay that shares its time origin with
++# the IRF (zero physical offset) is fitted with shift = +0.5 bins, not 0. The
++# physical offset between IRF and data is therefore  fitted shift - 0.5.
++_BIN_CONVENTION_SHIFT = 0.5
++
++
++def _fitted_time_offset(signal_sum, irf_norm, tpb_ns):
++    """Physical timing offset (bins; positive = the data lags the IRF) between
++    the data and the IRF, from ONE mono-exponential reconvolution fit of the
++    pooled curve, with the half-bin convention removed (see
++    _BIN_CONVENTION_SHIFT). This is a sub-bin estimate of the TIME-ZERO offset.
++    estimate_shift cannot provide that: it aligns the IRF to the decay's PEAK,
++    and a decay's peak always lags its time zero, by about 4-7 bins for a
++    0.25 ns IRF and 50 ps bins, so using it as a time offset subtracts a
++    spurious ~0.3 ns from a moment-based lifetime.
++    Falls back to the coarse integer estimate if the fit fails."""
++    try:
++        fitted = float(global_reconv_fit(signal_sum, irf_norm, tpb_ns)["shift"])
++        if np.isfinite(fitted) and abs(fitted) < IRF_SHIFT_SEARCH:
++            return fitted - _BIN_CONVENTION_SHIFT
++    except Exception:
++        pass
++    return float(estimate_shift(signal_sum, irf_norm))
++
++
+ def make_conv_model_mono(irf_norm, tpb_ns, fix_shift=None):
+     """Mono-exponential reconvolution model(params) -> full decay curve.
+     Normally params are (A, tau, C, shift), with `shift` (bins, continuous)
+@@ -557,7 +585,7 @@
+                n_photons=n_photons_map, converged=converged_map, nll=nll_map)
+ 
+ 
+-def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False):
++def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False, shift_method="fit"):
+     """IRF-corrected intensity-weighted mean arrival time, per masked pixel
+     -- a fit-free (no nonlinear optimization) alternative to the biexponential
+     reconvolution fit, in the same spirit as fitting.mean_arrival_time but
+@@ -580,16 +608,23 @@
+     On REAL two-file data (a separately-recorded IRF file), that shared-
+     origin assumption doesn't hold automatically: the IRF and decay
+     acquisitions can carry a genuine relative timing offset (electronics,
+-    cabling, or just being separate acquisitions), the same offset the
+-    reconvolution fits solve for via a free `shift` parameter. A moment
+-    calculation has no such per-fit freedom to compensate, so this function
+-    aligns irf_norm to the data ONCE, via the same coarse estimate_shift()
+-    cross-correlation used to seed the reconvolution fits, before taking its
+-    moment. This won't be as precise as a fitted sub-bin shift (on real data,
+-    skipping it entirely left an uncorrected timing bias of several tenths
+-    of a ns), but keeps this method's core advantage -- no nonlinear fit at
+-    all, safe even at very low photon counts -- rather than requiring a
+-    biexponential fit first just to get a precise shift.
++    cabling, or just being separate acquisitions). If the data lag the IRF
++    by delta, mean(data) = tau + mean(irf) + delta, so delta has to be
++    estimated and subtracted too. shift_method chooses how:
++      "fit" (default): delta comes from ONE biexponential reconvolution
++        fit of the pooled (masked-region) curve, with its half-bin sampling
++        convention removed -- a sub-bin estimate of the true time-zero offset
++        (see _fitted_time_offset). One fit on one curve, so the per-pixel
++        moments stay fit-free and safe at low photon counts.
++      "xcorr": the previous behaviour, the integer cross-correlation
++        estimate_shift. That aligns the IRF to the decay's PEAK, which lags
++        the time zero by several bins, so it biases tau_mean low by about
++        0.3 ns (5.4 instead of 5.8 ns for a 6 ns decay; 1.65 instead of 1.95
++        for 2 ns). Kept only to reproduce old runs.
++    no_shift=True skips the offset entirely (delta = 0): use it only when IRF
++    and data were acquired with matched laser settings in the same session.
++    Because first moments add, the result does not depend on whether the
++    caller already shifted irf_norm beforehand.
+ 
+     Two more things this borrows directly from fitting.mean_arrival_time,
+     after an early version of this function (using the full window and
+@@ -633,16 +668,19 @@
+     t_bins = np.arange(nb)
+ 
+     signal_sum = cube[mask].sum(axis=0).astype(float)
++    if shift_method not in ("fit", "xcorr"):
++        raise ValueError(f"shift_method must be 'fit' or 'xcorr', got {shift_method!r}")
+     if no_shift:
+         # See make_conv_model_mono's no_shift docs: matched laser settings
+         # between IRF and data mean no physical timing-walk offset is
+         # expected, so skip the alignment step entirely.
+         shift = 0.0
+-        irf_aligned = irf_norm
++    elif shift_method == "xcorr":
++        shift = float(estimate_shift(signal_sum, irf_norm))
+     else:
+-        shift = estimate_shift(signal_sum, irf_norm)
+-        irf_aligned = shift_array(irf_norm, shift)
+-    irf_mean_bins = np.sum(t_bins * irf_aligned)   # irf_aligned already sums to 1
++        shift = _fitted_time_offset(signal_sum, irf_norm, tpb_ns)
++    # First moment of the IRF delayed by `shift` bins (irf_norm sums to 1).
++    irf_mean_bins = np.sum(t_bins * irf_norm) + shift
+ 
+     n_bg_bins = min(20, nb)
+     pooled_bs = signal_sum - np.mean(signal_sum[-n_bg_bins:])

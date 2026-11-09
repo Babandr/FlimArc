@@ -36,7 +36,7 @@ from flim_core.masking import (
 from flim_core.fitting import _tail_axis, global_fit, fit_pixels_mono, fit_pixels, mean_arrival_time
 from flim_core.plotting import plot_overview_and_mask, plot_results, plot_fit_quality
 from flim_core.irf import (
-    load_irf, estimate_shift, shift_array,
+    load_irf,
     global_reconv_fit, global_reconv_fit_mono,
     fit_pixels_reconv, fit_pixels_reconv_mono,
     mean_arrival_time_reconv,
@@ -258,18 +258,16 @@ def process_file(h5file, args):
 
     if fit_method in ("irf", "mean_irf"):
         signal_sum = cube[mask].sum(axis=0).astype(float)
-        if no_shift:
-            # Skip the external pre-alignment entirely -- with the internal
-            # fit model also fixing shift at 0 (passed below), pre-shifting
-            # the kernel here would just reintroduce an offset through the
-            # back door.
-            shift = 0.0
-            irf_aligned = irf["irf_norm"]
-        else:
-            shift = estimate_shift(signal_sum, irf["irf_norm"])
-            irf_aligned = shift_array(irf["irf_norm"], shift)
-        print(f"\n  IRF-to-data alignment: shift = {shift} bins ({shift*s['tpb']*1e9:.3f} ns)"
-              f"{' (fixed, not fitted)' if no_shift else ''}")
+        # The IRF is used exactly as measured -- no external pre-alignment. The fit models find the
+        # IRF/data timing offset themselves (free shift parameter), or hold it at "no offset" with
+        # --no-shift. Pre-shifting the IRF onto the decay's PEAK used to be done here, but that only moved
+        # the decay's peak lag (~17 bins for a 0.7 ns IRF and a 4 ns dye, more for longer lifetimes or
+        # broader IRFs) into the fit's free shift, which then broke whenever IRF_SHIFT_SEARCH was smaller
+        # than that lag. The measured offset is reported in the *_irf_check.png.
+        shift = 0.0
+        irf_aligned = irf["irf_norm"]
+        print(f"\n  IRF-to-data timing offset: "
+              f"{'fixed at 0 (--no-shift)' if no_shift else 'fitted together with the lifetime (see the IRF check plot)'}")
 
     if fit_method == "irf":
         if args.mono:

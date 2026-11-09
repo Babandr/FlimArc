@@ -20,7 +20,10 @@ from flim_core.masking import (
     clean_mask, bin_cube, bin_time_cube, moving_average_cube, report_dead_pixels,
 )
 from flim_core.config import TAIL_START_OFFSET
-from flim_core.fitting import _tail_axis, global_fit, fit_pixels, fit_pixels_mono, _resolve_bounds, _curve_fit_std, mean_arrival_time
+from flim_core.fitting import (
+    _tail_axis, global_fit, fit_pixels, fit_pixels_mono, _resolve_bounds, _curve_fit_std,
+    mean_arrival_time, _poisson_refine, _param_std_full, _curve_fit_tail,
+)
 from flim_core.plotting import plot_overview_and_mask, plot_results, plot_fit_quality
 from flim_core.irf import (
     global_reconv_fit, global_reconv_fit_mono, global_reconv_fit_fixed_short,
@@ -555,27 +558,60 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
     return dict(group=g_idx, median=summary_val, iqr=summary_iqr, n_pixels=int(mask.sum()))
 
 
-def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None):
+def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None,
+                           estimator="poisson", fit_background=True):
     """Tail fit with tau_short pinned to a known value; only tau_long floats.
     global_fit() itself has no fixed-tau_short mode (that's only offered for
     the main script's per-pixel fit_pixels, since a global/pooled fit
     normally has plenty of photons for a free fit already) -- but a single
     time window here can still be photon-limited for a short --step, so this
-    mirrors that same stabilization for the pooled-curve fit."""
+    mirrors that same stabilization for the pooled-curve fit.
+
+    estimator: "poisson" (default) or "leastsq" -- same meaning as in
+    flim_core.fitting.global_fit: the weighted curve_fit result is the seed,
+    refined by a Poisson fit (the weighted fit alone is biased at low
+    photon counts); "leastsq" returns the curve_fit result as before.
+
+    fit_background: True (default) fits a constant background C; False holds
+    C = 0 -- see flim_core.fitting.global_fit for when that is appropriate."""
+    if estimator not in ("poisson", "leastsq"):
+        raise ValueError(f"estimator must be 'poisson' or 'leastsq', got {estimator!r}")
     _, tau_long_bounds, _ = _resolve_bounds(None, tau_long_bounds, None)
     yv = summed[s_idx:].astype(float)
 
     def model(t, A1, A2, t2, C):
         return A1 * np.exp(-t / tau_short_fixed) + A2 * np.exp(-t / t2) + C
 
-    p0 = [yv.max() * 0.6, yv.max() * 0.4, sum(tau_long_bounds) / 2, yv.min() + 1]
-    popt, pcov = curve_fit(model, tn, yv, p0=p0, sigma=np.sqrt(np.maximum(yv, 1)),
-                        bounds=([0, 0, tau_long_bounds[0], 0],
-                                [np.inf, np.inf, tau_long_bounds[1], np.inf]),
-                        maxfev=20000)
+    p0 = [yv.max() * 0.6, yv.max() * 0.4, sum(tau_long_bounds) / 2,
+          (yv.min() + 1) if fit_background else 0.0]
+    lo = [0, 0, tau_long_bounds[0], 0]
+    hi = [np.inf, np.inf, tau_long_bounds[1], np.inf]
+    c_max = np.inf if fit_background else 0.0
+    free = [0, 1, 2, 3] if fit_background else [0, 1, 2]
+    try:
+        popt, pcov = _curve_fit_tail(model, tn, yv, p0, lo, hi, fit_background)
+    except (RuntimeError, ValueError):
+        if estimator != "poisson":
+            raise
+        popt, pcov = np.array(p0, dtype=float), None
+    std_of = lambda i: _curve_fit_std(pcov, i)
+    used = "leastsq"
+    if estimator == "poisson":
+        refined = _poisson_refine(model, tn, yv, popt, list(zip(lo, hi[:-1] + [c_max])))
+        if refined is not None:
+            popt, dev = refined
+            std_of = lambda i: _param_std_full(dev, popt, i, free=free)
+            used = "poisson"
+        elif pcov is None:
+            raise RuntimeError("global_fit_fixed_short: both curve_fit and the Poisson fit failed.")
+        else:
+            import warnings
+            warnings.warn("global_fit_fixed_short: Poisson refinement failed, using curve_fit result instead.",
+                          RuntimeWarning)
     A1, A2, t2, C = popt
-    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_curve_fit_std(pcov, 2),
-               popt=popt, model=model, yv=yv, mono=False)
+    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=std_of(2),
+               popt=popt, model=model, yv=yv, mono=False, estimator=used,
+               fit_background=fit_background)
 
 
 def fit_window_sum(cube, mask, s_like, mono, tau_short_fixed=None, offset=None,

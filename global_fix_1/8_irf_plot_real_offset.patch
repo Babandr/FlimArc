@@ -1,0 +1,110 @@
+--- a/flim_core/irf.py	2026-11-04 14:13:39.354751881 +0000
++++ b/flim_core/irf.py	2026-11-04 14:13:39.356237558 +0000
+@@ -244,6 +244,22 @@
+ _BIN_CONVENTION_SHIFT = 0.5
+ 
+ 
++def fitted_timing_offset(g, pre_shift=0.0):
++    """Physical timing offset between data and IRF, in bins (positive = the
++    data lag the IRF), read off a reconvolution fit result g.
++
++    g["shift"] is the shift the fit applied to its model, which includes the
++    +0.5-bin sampling convention (see _BIN_CONVENTION_SHIFT) and compensates
++    whatever pre_shift the caller applied to the IRF beforehand (the plugins
++    still pre-align it on the decay's peak, ~15 bins, as a starting point).
++    The physical offset is therefore  g["shift"] + pre_shift - 0.5, whichever
++    way the IRF was prepared; with --no-shift the model shift is fixed at 0.5,
++    so this is exactly 0. Returns NaN if g has no "shift"."""
++    if g is None or g.get("shift") is None:
++        return float("nan")
++    return float(g["shift"]) + float(pre_shift) - _BIN_CONVENTION_SHIFT
++
++
+ def _fitted_time_offset(signal_sum, irf_norm, tpb_ns):
+     """Physical timing offset (bins; positive = the data lags the IRF) between
+     the data and the IRF, from ONE mono-exponential reconvolution fit of the
+@@ -786,36 +802,69 @@
+     return dict(tau_mean=tau_mean, tau_mean_std=tau_mean_std, n_photons=n_photons_map, shift=shift)
+ 
+ 
++def _shift_linear(a, shift):
++    """Shift array `a` later by `shift` bins (any float) with linear
++    interpolation and zero fill. Used only to DRAW the IRF: unlike the FFT
++    shift the fits use (shift_signal_subbin), it has no ringing around the
++    IRF window's sharp edges, which showed up as a fuzzy band on the log
++    plot."""
++    idx = np.arange(len(a), dtype=float)
++    return np.interp(idx - float(shift), idx, a, left=0.0, right=0.0)
++
++
+ def plot_irf_diagnostic(irf, signal_sum, shift, g, tpb, out_png, show, n_signal, unit):
+     """Signal-only summed data decay (from the masked pixels/super-pixels)
+-    vs the (aligned, background-subtracted) IRF vs the fitted reconvolution
+-    model -- a visual check that the IRF genuinely explains the data's
+-    rising edge and that the fit tracks the measured curve."""
++    vs the (background-subtracted) IRF vs the fitted reconvolution model -- a
++    visual check that the IRF genuinely explains the data's rising edge and
++    that the fit tracks the measured curve.
++
++    `shift` is the integer the caller pre-shifted the IRF by (the coarse
++    peak alignment; 0 if none). The IRF is DRAWN at its real position
++    relative to the data: shifted by the fitted physical timing offset
++    (fitted_timing_offset), not by the peak alignment. A decay always peaks
++    later than its IRF (here ~0.6 ns for a 0.7 ns wide IRF and a 4 ns
++    lifetime) without any timing offset at all, so drawing the IRF on top of
++    the data peak, as this plot used to do, made a large offset look
++    necessary. The legend and title give the fitted offset (in ps) and that
++    expected peak lag."""
+     nb = len(signal_sum)
+     t_ns = np.arange(nb) * tpb * 1e9
+-    irf_aligned = shift_array(irf["irf_norm"], shift) * signal_sum.max() / irf["irf_norm"].max()
++    offset = fitted_timing_offset(g, shift)
++    have_offset = np.isfinite(offset)
++    irf_drawn = _shift_linear(irf["irf_norm"], offset if have_offset else float(shift))
++    irf_drawn = irf_drawn * signal_sum.max() / irf["irf_norm"].max()
++    model_curve = g["model"](g["popt"])
+ 
+     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+     ax.semilogy(t_ns, signal_sum + 1, color="black", lw=1.2,
+                 label=f"Data (summed over {n_signal} masked {unit})")
+-    ax.semilogy(t_ns, irf_aligned + 1, color="tab:blue", lw=1.0, alpha=0.7,
+-                label=f"IRF (background-subtracted, aligned, shift={shift} bins)")
++    if have_offset:
++        irf_label = (f"IRF (background-subtracted, at its fitted timing offset "
++                     f"{offset * tpb * 1e12:+.0f} ps = {offset:+.1f} bins)")
++    else:
++        irf_label = f"IRF (background-subtracted, aligned, shift={shift} bins)"
++    ax.semilogy(t_ns, irf_drawn + 1, color="tab:blue", lw=1.0, alpha=0.7, label=irf_label)
+     if g.get("mono"):
+         fit_label = f"Reconvolution fit (\u03c4={g['tau']:.2f} ns)"
+     else:
+         fit_label = f"Reconvolution fit (\u03c4s={g['tau_short']:.2f}, \u03c4l={g['tau_long']:.2f} ns)"
+-    ax.semilogy(t_ns, g["model"](g["popt"]) + 1, color="tab:red", lw=1.2, ls="--",
+-                label=fit_label)
++    ax.semilogy(t_ns, model_curve + 1, color="tab:red", lw=1.2, ls="--", label=fit_label)
+     ax.set_xlabel("Time (ns)")
+     ax.set_ylabel("Photon counts (+1, log scale)")
+-    title = (f"IRF check: FWHM {irf['fwhm_bins']*tpb*1e9:.2f} ns, "
+-             f"{irf['bg_fraction']*100:.0f}% of raw IRF was background (removed), "
+-             f"source: {irf['source']}")
++    import textwrap
++    parts = [f"IRF check: FWHM {irf['fwhm_bins']*tpb*1e9:.2f} ns, "
++             f"{irf['bg_fraction']*100:.0f}% of raw IRF was background (removed)",
++             f"source: {irf['source']}"]
++    if have_offset:
++        lag_ns = t_ns[int(np.argmax(model_curve))] - t_ns[int(np.argmax(irf_drawn))]
++        parts.append(f"fitted IRF/data timing offset {offset * tpb * 1e12:+.0f} ps; the fitted decay peaks "
++                     f"{lag_ns:.2f} ns after the IRF peak (a decay always peaks after its IRF)")
+     if irf.get("echo_fraction", 0) > 0.005:
+-        title += (f"\n{irf['echo_fraction']*100:.1f}% of the background-subtracted IRF was a "
+-                  f"disconnected secondary peak (windowed out, kept bins {irf['window'][0]}-{irf['window'][1]})")
+-    ax.set_title(title, fontsize=10)
+-    ax.legend(fontsize=9)
++        parts.append(f"{irf['echo_fraction']*100:.1f}% of the background-subtracted IRF was a "
++                     f"disconnected secondary peak (windowed out, kept bins {irf['window'][0]}-{irf['window'][1]})")
++    title = "\n".join(textwrap.fill(p, 105) for p in parts)
++    ax.set_title(title, fontsize=8.5)
++    ax.legend(fontsize=8)
+     fig.tight_layout()
+     fig.savefig(out_png, dpi=130)
+     print(f"  saved {out_png}")

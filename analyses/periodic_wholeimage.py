@@ -23,7 +23,7 @@ from flim_core.fitting import _tail_axis
 from flim_core.plotting import plot_overview, plot_overview_and_mask
 from flim_core.fitting import AnalysisCancelled
 from flim_core.irf import (
-    load_irf, estimate_shift, shift_array,
+    load_irf,
     global_reconv_fit, global_reconv_fit_mono,
     plot_irf_diagnostic,
 )
@@ -341,18 +341,16 @@ def run(args):
     irf_aligned = None
     if fit_method in ("irf", "mean_irf"):
         whole_signal_sum = full_cube[mask].sum(axis=0).astype(float)
-        if no_shift:
-            # Skip the external pre-alignment entirely -- the fit models below
-            # also fix shift at 0, so pre-shifting the kernel here would just
-            # reintroduce an offset through the back door.
-            shift = 0.0
-            irf_aligned = irf["irf_norm"]
-        else:
-            shift = estimate_shift(whole_signal_sum, irf["irf_norm"])
-            irf_aligned = shift_array(irf["irf_norm"], shift)
-        print(f"\n  IRF-to-data alignment (whole acquisition, masked region): "
-              f"shift = {shift} bins ({shift*d['tpb']*1e9:.3f} ns)"
-              f"{' (fixed, not fitted)' if no_shift else ''}")
+        # The IRF is used exactly as measured -- no external pre-alignment. The fit models find the
+        # IRF/data timing offset themselves (free shift parameter), or hold it at "no offset" with
+        # --no-shift. Pre-shifting the IRF onto the decay's PEAK used to be done here, but that only moved
+        # the decay's peak lag (~17 bins for a 0.7 ns IRF and a 4 ns dye, more for longer lifetimes or
+        # broader IRFs) into the fit's free shift, which then broke whenever IRF_SHIFT_SEARCH was smaller
+        # than that lag. The measured offset is reported in the *_irf_check.png.
+        shift = 0.0
+        irf_aligned = irf["irf_norm"]
+        print(f"\n  IRF-to-data timing offset (whole acquisition, masked region): "
+              f"{'fixed at 0 (--no-shift)' if no_shift else 'fitted together with the lifetime (see the IRF check plot)'}")
         if fit_method == "irf":
             # mean_irf has no reference fit / diagnostic plot -- only the alignment above.
             if args.mono:

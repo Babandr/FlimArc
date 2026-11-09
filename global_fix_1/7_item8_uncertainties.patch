@@ -1,0 +1,259 @@
+--- a/flim_core/fitting.py	2026-11-04 11:21:42.416344338 +0000
++++ b/flim_core/fitting.py	2026-11-04 11:21:42.418827851 +0000
+@@ -151,7 +151,7 @@
+         return None
+ 
+ 
+-def _param_std_full(nll_func, p_hat, idx, args=(), free=None):
++def _param_std_full(nll_func, p_hat, idx, args=(), free=None, bounds=None):
+     """1-sigma uncertainty on parameter p_hat[idx] from the FULL numerical
+     Hessian of nll_func at the fit (central differences, all parameters
+     free): sigma = sqrt([H^-1]_idx,idx). Unlike _param_std, which holds the
+@@ -165,9 +165,21 @@
+     free: optional list of the parameter indices that were actually fitted.
+     Parameters held fixed (e.g. the background C when fit_background=False)
+     must be left out, otherwise their curvature would inflate the error of
+-    the free ones as if they had been fitted too."""
++    the free ones as if they had been fitted too.
++
++    bounds: optional list of (low, high) per parameter. Parameters sitting ON
++    a bound are treated as fixed (the usual constrained-optimum convention).
++    If the requested parameter itself sits on a bound, its curvature isn't
++    meaningful and the fixed-parameter estimate (_param_std) is returned
++    instead."""
+     p = np.asarray(p_hat, dtype=float)
+     free = list(range(len(p))) if free is None else list(free)
++    if bounds is not None:
++        on_bound = [i for i, (lo, hi) in enumerate(bounds)
++                    if np.isclose(p[i], lo, rtol=1e-6, atol=1e-9) or np.isclose(p[i], hi, rtol=1e-6, atol=1e-9)]
++        if idx in on_bound:
++            return _param_std(nll_func, p_hat, idx, args=args)
++        free = [i for i in free if i not in on_bound]
+     n = len(free)
+     h = np.maximum(np.abs(p) * 0.01, 1e-4)
+     H = np.zeros((n, n))
+@@ -186,7 +198,7 @@
+                 j = free[jj]
+                 H[ii, jj] = H[jj, ii] = (f(i, 1, j, 1) - f(i, 1, j, -1)
+                                          - f(i, -1, j, 1) + f(i, -1, j, -1)) / (4 * h[i] * h[j])
+-        var = np.linalg.inv(H)[free.index(idx), free.index(idx)]
++        var = _inv_diag_entry(H, free.index(idx))
+     except Exception:
+         return np.nan
+     return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
+@@ -209,6 +221,70 @@
+     return np.append(popt, 0.0), pcov_full
+ 
+ 
++def _inv_diag_entry(M, k):
++    """[M^-1]_kk for a symmetric information/Hessian matrix M, or NaN if
++    parameter k itself carries no information.
++
++    Parameters with (numerically) zero curvature are dropped first. That
++    happens in practice: when a biexponential pixel collapses to one
++    component (that component's amplitude pinned at 0), its lifetime has no
++    effect on the model at all, M is exactly singular along that direction,
++    and the plain inverse turns the std of EVERY parameter into NaN -- about
++    a third of dim biexponential pixels. Dropping the dead parameter gives
++    the remaining ones their proper (single-component) uncertainty, while
++    the dead lifetime itself is reported as NaN (unidentifiable), not as a
++    confident-looking number.
++
++    The inverse is computed on the diagonally rescaled matrix
++    D^-1/2 M D^-1/2, so parameters whose curvature differs by many orders of
++    magnitude do not spoil its accuracy."""
++    d = np.diag(M)
++    alive = d > 1e-14 * np.max(d)
++    if not alive[k]:
++        return np.nan
++    M = M[np.ix_(alive, alive)]
++    k = int(np.sum(alive[:k]))
++    s = 1.0 / np.sqrt(np.diag(M))
++    return np.linalg.inv(M * s[:, None] * s[None, :])[k, k] * s[k] ** 2
++
++
++def _param_std_fisher(model, p_hat, idx, free=None, bounds=None, fallback=None):
++    """1-sigma uncertainty on parameter p_hat[idx] from the Poisson FISHER
++    INFORMATION, F_ij = sum_k (dm_k/dp_i)(dm_k/dp_j) / m_k, with the model
++    derivatives taken by central differences; sigma = sqrt([F^-1]_idx,idx).
++    This is the expected value of the Hessian that _param_std_full computes
++    by second differences, but needs only ~2n model evaluations instead of
++    ~2n^2 -- the difference between +5 % and +40 % run time per pixel for a
++    reconvolution fit -- and it accounts for the correlations between
++    parameters that the fixed-parameter shortcut (_param_std) ignores, which
++    made biexponential pixel uncertainties ~4x too small.
++
++    model(p) -> expected counts per bin. free / bounds: as in
++    _param_std_full (parameters on a bound are treated as fixed; if the
++    requested parameter itself is on a bound, fallback() is returned if
++    given, else NaN)."""
++    p = np.asarray(p_hat, dtype=float)
++    free = list(range(len(p))) if free is None else list(free)
++    if bounds is not None:
++        on_bound = [i for i, (lo, hi) in enumerate(bounds)
++                    if np.isclose(p[i], lo, rtol=1e-6, atol=1e-9) or np.isclose(p[i], hi, rtol=1e-6, atol=1e-9)]
++        if idx in on_bound:
++            return fallback() if fallback is not None else np.nan
++        free = [i for i in free if i not in on_bound]
++    try:
++        m = np.maximum(model(p), 1e-9)
++        J = np.empty((len(free), m.size))
++        for a, i in enumerate(free):
++            h = max(abs(p[i]) * 1e-3, 1e-4)
++            q = p.copy(); q[i] = p[i] + h; up = model(q)
++            q[i] = p[i] - h; dn = model(q)
++            J[a] = (up - dn) / (2 * h)
++        var = _inv_diag_entry((J / m) @ J.T, free.index(idx))
++    except Exception:
++        return np.nan
++    return float(np.sqrt(var)) if np.isfinite(var) and var > 0 else np.nan
++
++
+ def _tail_axis(s, cube, offset=None):
+     """Determine the peak, tail-start bin and the ns time axis for the tail.
+     offset: bins after the peak where the tail fit starts (default:
+@@ -369,10 +445,12 @@
+     nll_map = np.full((H, W), np.nan)
+     tau_seed = sum(tau_mono_bounds) / 2
+ 
+-    def nll(p, k):
++    def model(p):
+         A, tau, C = p
+-        m = A * np.exp(-tn / tau) + C
+-        m = np.maximum(m, 1e-9)
++        return A * np.exp(-tn / tau) + C
++
++    def nll(p, k):
++        m = np.maximum(model(p), 1e-9)
+         return np.sum(m - k * np.log(m))
+ 
+     ys, xs = np.where(mask)
+@@ -388,7 +466,8 @@
+         bnds = [(0, pk * 6), tau_mono_bounds, (0, pk if fit_background else 0.0)]
+         r = minimize(nll, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+         tau_map[i, j] = r.x[1]
+-        tau_std_map[i, j] = _param_std(nll, r.x, 1, args=(k,))
++        tau_std_map[i, j] = _param_std_fisher(model, r.x, 1, bounds=bnds,
++                                               fallback=lambda: _param_std(nll, r.x, 1, args=(k,)))
+         n_photons_map[i, j] = k.sum()
+         converged_map[i, j] = bool(r.success)
+         nll_map[i, j] = r.fun
+@@ -426,16 +505,20 @@
+     ts_seed = sum(tau_short_bounds) / 2
+     tl_seed = sum(tau_long_bounds) / 2
+ 
+-    def nll_free(p, k):
++    def model_free(p):
+         A1, t1, A2, t2, C = p
+-        m = A1 * np.exp(-tn / t1) + A2 * np.exp(-tn / t2) + C
+-        m = np.maximum(m, 1e-9)
++        return A1 * np.exp(-tn / t1) + A2 * np.exp(-tn / t2) + C
++
++    def model_fixed(p):
++        A1, A2, t2, C = p
++        return A1 * np.exp(-tn / tau_short_fixed) + A2 * np.exp(-tn / t2) + C
++
++    def nll_free(p, k):
++        m = np.maximum(model_free(p), 1e-9)
+         return np.sum(m - k * np.log(m))
+ 
+     def nll_fixed(p, k):
+-        A1, A2, t2, C = p
+-        m = A1 * np.exp(-tn / tau_short_fixed) + A2 * np.exp(-tn / t2) + C
+-        m = np.maximum(m, 1e-9)
++        m = np.maximum(model_fixed(p), 1e-9)
+         return np.sum(m - k * np.log(m))
+ 
+     ys, xs = np.where(mask)
+@@ -458,15 +541,18 @@
+             # the right covariance-index gets the right std.
+             idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
+             tau_short[i, j], tau_long[i, j] = sorted([t1, t2])
+-            tau_short_std[i, j] = _param_std(nll_free, r.x, idx_short, args=(k,))
+-            tau_long_std[i, j] = _param_std(nll_free, r.x, idx_long, args=(k,))
++            tau_short_std[i, j] = _param_std_fisher(model_free, r.x, idx_short, bounds=bnds,
++                                                    fallback=lambda: _param_std(nll_free, r.x, idx_short, args=(k,)))
++            tau_long_std[i, j] = _param_std_fisher(model_free, r.x, idx_long, bounds=bnds,
++                                                   fallback=lambda: _param_std(nll_free, r.x, idx_long, args=(k,)))
+         else:
+             p0 = [pk * 0.6, pk * 0.4, tl_seed, bg]
+             bnds = [(0, pk * 6), (0, pk * 6), tau_long_bounds, (0, c_max)]
+             r = minimize(nll_fixed, p0, args=(k,), method="L-BFGS-B", bounds=bnds)
+             tau_short[i, j] = tau_short_fixed
+             tau_long[i, j]  = r.x[2]
+-            tau_long_std[i, j] = _param_std(nll_fixed, r.x, 2, args=(k,))
++            tau_long_std[i, j] = _param_std_fisher(model_fixed, r.x, 2, bounds=bnds,
++                                                   fallback=lambda: _param_std(nll_fixed, r.x, 2, args=(k,)))
+         n_photons_map[i, j] = k.sum()
+         converged_map[i, j] = bool(r.success)
+         nll_map[i, j] = r.fun
+--- a/flim_core/irf.py	2026-11-04 11:21:42.417697087 +0000
++++ b/flim_core/irf.py	2026-11-04 11:21:42.420349204 +0000
+@@ -15,8 +15,8 @@
+ 
+ from .config import IRF_SHIFT_SEARCH, TAU_SHORT_BOUNDS, TAU_LONG_BOUNDS, TAU_MONO_BOUNDS
+ from .io import load_flim_data, build_decay_cube
+-from .fitting import (_resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff, _poisson_fit,
+-                      _tail_extrapolation)
++from .fitting import (_resolve_bounds, _param_std, _param_std_full, _param_std_fisher, AnalysisCancelled,
++                      _tail_signal_cutoff, _poisson_fit, _tail_extrapolation)
+ 
+ 
+ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
+@@ -400,7 +400,7 @@
+         bounds = [(0, pk * 10), tau_mono_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+         x, nll = _poisson_fit(model, yv, p0, bounds)
+         A, tau, C, shift = x
+-    return dict(tau=tau, tau_std=_param_std(nll, x, 1), popt=x, model=model, yv=yv, mono=True, shift=shift)
++    return dict(tau=tau, tau_std=_param_std_full(nll, x, 1, bounds=bounds), popt=x, model=model, yv=yv, mono=True, shift=shift)
+ 
+ 
+ def fit_pixels_reconv_mono(cube, irf_norm, tpb_ns, mask, tau_mono_bounds=None, cancel_check=None, no_shift=False,
+@@ -447,7 +447,7 @@
+             bnds = [(0, pk * 6), tau_mono_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+         x, dev, r = _poisson_fit(model, k, p0, bnds, ftol=1e-10, gtol=1e-6, return_result=True)
+         tau_map[i, j] = x[1]
+-        tau_std_map[i, j] = _param_std(dev, x, 1)
++        tau_std_map[i, j] = _param_std_fisher(model, x, 1, bounds=bnds, fallback=lambda: _param_std(dev, x, 1))
+         n_photons_map[i, j] = k.sum()
+         converged_map[i, j] = bool(r.success)
+         nll_map[i, j] = dev(x) + _nll_offset(k)
+@@ -486,7 +486,7 @@
+         bounds = [(0, pk * 10), (0, pk * 10), tau_long_bounds, (0, c_max), (-IRF_SHIFT_SEARCH, IRF_SHIFT_SEARCH)]
+         x, nll = _poisson_fit(model, yv, p0, bounds)
+         A1, A2, t2, C, shift = x
+-    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_param_std(nll, x, 2),
++    return dict(tau_short=tau_short_fixed, tau_long=t2, tau_long_std=_param_std_full(nll, x, 2, bounds=bounds),
+                popt=x, model=model, yv=yv, mono=False, shift=shift)
+ 
+ 
+@@ -520,7 +520,8 @@
+     idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
+     ts, tl = sorted([t1, t2])
+     return dict(tau_short=ts, tau_long=tl,
+-               tau_short_std=_param_std(nll, x, idx_short), tau_long_std=_param_std(nll, x, idx_long),
++               tau_short_std=_param_std_full(nll, x, idx_short, bounds=bounds),
++               tau_long_std=_param_std_full(nll, x, idx_long, bounds=bounds),
+                popt=x, model=model, yv=yv, shift=shift)
+ 
+ 
+@@ -585,8 +586,8 @@
+             t1, t2 = x[1], x[3]
+             idx_short, idx_long = (1, 3) if t1 <= t2 else (3, 1)
+             tau_short[i, j], tau_long[i, j] = sorted([t1, t2])
+-            tau_short_std[i, j] = _param_std(dev, x, idx_short)
+-            tau_long_std[i, j] = _param_std(dev, x, idx_long)
++            tau_short_std[i, j] = _param_std_fisher(model_free, x, idx_short, bounds=bnds, fallback=lambda: _param_std(dev, x, idx_short))
++            tau_long_std[i, j] = _param_std_fisher(model_free, x, idx_long, bounds=bnds, fallback=lambda: _param_std(dev, x, idx_long))
+         else:
+             if no_shift:
+                 p0 = [pk * 0.6, pk * 0.4, tl_seed, bg]
+@@ -598,7 +599,7 @@
+             x, dev, r = _poisson_fit(model_fixed, k, p0, bnds, ftol=1e-10, gtol=1e-6, return_result=True)
+             tau_short[i, j] = tau_short_fixed
+             tau_long[i, j] = x[2]
+-            tau_long_std[i, j] = _param_std(dev, x, 2)
++            tau_long_std[i, j] = _param_std_fisher(model_fixed, x, 2, bounds=bnds, fallback=lambda: _param_std(dev, x, 2))
+         n_photons_map[i, j] = k.sum()
+         converged_map[i, j] = bool(r.success)
+         nll_map[i, j] = dev(x) + _nll_offset(k)

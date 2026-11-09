@@ -122,9 +122,10 @@ def _load_raw(f):
     # bits 28-31 = record type (0x2 = photon, 0xF = marker/other -> discarded).
     top = (data >> 28) & 0xF
     ph = data[top == 0x2]                    # photon records only
-    #x  = (ph & 0xFF).astype(np.int32) - 1    # bits 0-7:  column (file is 1-indexed -> shift to 0-indexed) was before not sure
-    x  = (ph & 0xFF).astype(np.int32)
-    y  = ((ph >> 8) & 0xFF).astype(np.int32) # bits 8-15: row
+    # bits 0-7: column. File is 1-indexed (verified on a real raw file: x runs
+    # 1..CameraWidth), so shift to 0-indexed, same as load_raw_with_time.
+    x  = (ph & 0xFF).astype(np.int32) - 1
+    y  = ((ph >> 8) & 0xFF).astype(np.int32) # bits 8-15: row (0-indexed, verified)
     micro = (((ph >> 24) & 0xF) << 8) | ((ph >> 16) & 0xFF)  # bits 16-27: 12-bit microtime bin
 
     if B0 is None:

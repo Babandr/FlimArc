@@ -1,0 +1,187 @@
+--- a/flim_core/fitting.py	2026-11-04 10:35:19.824797414 +0000
++++ b/flim_core/fitting.py	2026-11-04 10:35:19.827178493 +0000
+@@ -474,7 +474,7 @@
+                n_photons=n_photons_map, converged=converged_map, nll=nll_map)
+ 
+ 
+-def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True):
++def mean_arrival_time(cube, s_idx, tn, mask, subtract_background=True, correct_bias=True):
+     """Photon-weighted mean arrival time (the decay's first moment) of
+     every masked pixel's tail -- a fast, non-iterative alternative to
+     exponential fitting:
+@@ -497,6 +497,20 @@
+     that aren't part of the real decay would otherwise bias the mean toward
+     later times.
+ 
++    correct_bias=True (default) removes two small systematic errors, both of
++    which pull the result LOW (about 3-4 % for a 6 ns decay, 1-2 % for 2 ns):
++      * the cutoff below discards the last ~0.5 % of the pooled signal. That
++        is the LATEST light, so it carries a large time-weight and its loss
++        lowers the mean (5.75 instead of 5.95 ns for a 6 ns decay). The
++        missing part is extrapolated from the pooled curve's own tail
++        (_tail_extrapolation) and scaled for each pixel by that pixel's share
++        of the late signal, so a short-lived pixel in the same mask is not
++        over-corrected. Skipped when the tail cannot be extrapolated
++        reliably (too few counts, or the decay is far from finished).
++      * times are taken at bin CENTRES instead of left edges (+half a bin,
++        0.025 ns at 50 ps).
++    False reproduces the previous numbers.
++
+     Also returns the standard error of the mean -- exact, not an
+     approximation, for a weighted-mean estimator:
+ 
+@@ -561,16 +575,32 @@
+ 
+     pooled = tail[mask].sum(axis=0) if mask.any() else tail.sum(axis=(0, 1))
+     cutoff = _tail_signal_cutoff(pooled)
++    ext = _tail_extrapolation(pooled, cutoff) if correct_bias else None
++    dt = float(tn[1] - tn[0]) if len(tn) > 1 else 0.0
+     tail = tail[:, :, :cutoff]
+     tn = tn[:cutoff]
++    if correct_bias:
++        tn = tn + 0.5 * dt             # bin centres, not left edges
+ 
+     n_photons_raw = tail.sum(axis=2)   # [H, W] -- may be slightly negative for a
+                                         # pixel with ~no real signal above an
+                                         # over-subtracted background estimate.
+ 
+     with np.errstate(invalid="ignore", divide="ignore"):
+-        tau_mean_map = np.tensordot(tail, tn, axes=([2], [0])) / n_photons_raw
+-        deviation_sq = (tn[None, None, :] - tau_mean_map[:, :, None]) ** 2
++        weighted_sum = np.tensordot(tail, tn, axes=([2], [0]))
++        tau_trunc = weighted_sum / n_photons_raw     # mean over the kept window
++        if ext is not None:
++            # Each pixel's own share of the late (pre-cutoff) signal scales the
++            # extrapolated missing tail: no late light -> no correction.
++            share = tail[:, :, cutoff - ext["share_len"]:cutoff].sum(axis=2) / ext["s_share"]   # NOT clipped: noise stays zero-mean
++            missing_n = share * ext["n_ext"]
++            missing_t = share * dt * (ext["m_ext"] + 0.5 * ext["n_ext"])    # sum(time * counts), ns
++            tau_mean_map = (weighted_sum + missing_t) / (n_photons_raw + missing_n)
++        else:
++            tau_mean_map = tau_trunc
++        # the SEM describes the spread of the photons actually observed, i.e.
++        # around the mean of the kept window
++        deviation_sq = (tn[None, None, :] - tau_trunc[:, :, None]) ** 2
+         var_t = np.sum(tail * deviation_sq, axis=2) / n_photons_raw
+         # var_t is a sum of SIGNED terms (unclipped tail * a squared, always
+         # non-negative, distance), not a true sum-of-squares, so it can come
+@@ -631,3 +661,52 @@
+     cum = np.cumsum(clipped)
+     idx = int(np.searchsorted(cum, min_fraction * total)) + 1
+     return max(min(idx, n), min(min_bins, n))
++
++
++def _tail_extrapolation(pooled_bs, cutoff, min_block_counts=100.0, max_missing=0.05):
++    """Estimate the signal that the cutoff throws away, by extrapolating the
++    pooled background-subtracted curve beyond `cutoff` as a single
++    exponential. Its decay constant comes from the ratio of the summed signal
++    in the last two equal blocks (h bins each) before the cutoff, which is
++    robust to the negative residuals the background subtraction leaves.
++
++    Returns a dict, in units of counts and bin index counted from the start
++    of `pooled_bs`:
++      n_ext    the missing counts (sum from the cutoff to infinity)
++      m_ext    their first moment, sum(index * counts)
++      share_len, s_share  length of the window just before the cutoff and the
++               pooled signal in it; each pixel scales the correction by ITS
++               OWN share of that window, so a pixel that has no late light
++               is not corrected at all
++    or None when no reliable extrapolation exists: fewer than
++    min_block_counts counts in the block (the decay constant would be noise;
++    100 counts keeps its relative error near 15 %, and the correction itself
++    is only ~3 % of tau), a curve that is not decaying there, or an
++    estimated missing share above max_missing (a normal 99.5 % cutoff
++    misses ~0.5 %; much more means the decay is far from finished in the
++    window, and a longer window is the fix, not an extrapolation)."""
++    c = int(cutoff)
++    h = max(10, c // 5)
++    if c < 2 * h:
++        return None
++    s1 = float(pooled_bs[c - 2 * h:c - h].sum())
++    s2 = float(pooled_bs[c - h:c].sum())
++    if s2 < min_block_counts or s1 <= s2:
++        return None
++    q = (s2 / s1) ** (1.0 / h)                      # per-bin decay ratio, 0 < q < 1
++    if not (0.0 < q < 1.0):
++        return None
++    peak_at_c = s2 / np.sum(q ** -np.arange(1, h + 1))   # fitted signal in the first excluded bin
++    n_ext = peak_at_c / (1.0 - q)
++    m_ext = peak_at_c * (c / (1.0 - q) + q / (1.0 - q) ** 2)
++    n_in = float(np.clip(pooled_bs[:c], 0, None).sum())
++    if n_in <= 0 or n_ext / n_in > max_missing:
++        return None
++    # Window over which each pixel's share of the late signal is measured: 3
++    # blocks, because a pixel's share from one short block is dominated by
++    # shot noise, and that noise is correlated with the pixel's own moment
++    # (the same late photons feed both), which inflated the per-pixel scatter
++    # by ~25 %; the wider window brings that down to ~7 %.
++    share_len = min(3 * h, c)
++    return dict(n_ext=n_ext, m_ext=m_ext, share_len=share_len,
++                s_share=float(pooled_bs[c - share_len:c].sum()))
+--- a/flim_core/irf.py	2026-11-04 10:35:19.825971653 +0000
++++ b/flim_core/irf.py	2026-11-04 10:35:19.828336652 +0000
+@@ -15,7 +15,8 @@
+ 
+ from .config import IRF_SHIFT_SEARCH, TAU_SHORT_BOUNDS, TAU_LONG_BOUNDS, TAU_MONO_BOUNDS
+ from .io import load_flim_data, build_decay_cube
+-from .fitting import _resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff, _poisson_fit
++from .fitting import (_resolve_bounds, _param_std, AnalysisCancelled, _tail_signal_cutoff, _poisson_fit,
++                      _tail_extrapolation)
+ 
+ 
+ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
+@@ -585,7 +586,8 @@
+                n_photons=n_photons_map, converged=converged_map, nll=nll_map)
+ 
+ 
+-def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False, shift_method="fit"):
++def mean_arrival_time_reconv(cube, irf_norm, tpb_ns, mask, no_shift=False, shift_method="fit",
++                             correct_bias=True):
+     """IRF-corrected intensity-weighted mean arrival time, per masked pixel
+     -- a fit-free (no nonlinear optimization) alternative to the biexponential
+     reconvolution fit, in the same spirit as fitting.mean_arrival_time but
+@@ -626,6 +628,15 @@
+     Because first moments add, the result does not depend on whether the
+     caller already shifted irf_norm beforehand.
+ 
++    correct_bias=True (default) adds back the signal that the 99.5 % cutoff
++    below discards: the pooled curve's tail beyond the cutoff is extrapolated
++    as an exponential and each pixel gets a share proportional to its own
++    late signal (see fitting.mean_arrival_time and _tail_extrapolation). That
++    lost light is the latest, so without this the mean reads about 3 % low
++    (5.80 instead of 6.0 ns for a 6 ns decay). No bin-centre term is needed
++    here: data and IRF are binned the same way, so it cancels in the
++    subtraction. False reproduces the previous numbers.
++
+     Two more things this borrows directly from fitting.mean_arrival_time,
+     after an early version of this function (using the full window and
+     clipping negative residuals to zero) produced a per-pixel map that
+@@ -685,6 +696,7 @@
+     n_bg_bins = min(20, nb)
+     pooled_bs = signal_sum - np.mean(signal_sum[-n_bg_bins:])
+     cutoff = _tail_signal_cutoff(pooled_bs)
++    ext = _tail_extrapolation(pooled_bs, cutoff) if correct_bias else None
+     t_bins_c = t_bins[:cutoff]
+ 
+     tau_mean = np.full((H, W), np.nan)
+@@ -715,12 +727,18 @@
+         noise_floor = np.sqrt(max(cutoff * bg_i, 1.0))
+         if N <= 3 * noise_floor:
+             continue
+-        data_mean_bins = np.sum(t_bins_c * y) / N
++        weighted_sum = np.sum(t_bins_c * y)
++        trunc_mean_bins = weighted_sum / N                 # mean over the kept window
++        if ext is not None:
++            share = y[cutoff - ext["share_len"]:cutoff].sum() / ext["s_share"]   # NOT clipped: noise stays zero-mean
++            data_mean_bins = (weighted_sum + share * ext["m_ext"]) / (N + share * ext["n_ext"])
++        else:
++            data_mean_bins = trunc_mean_bins
+         tau_mean_i = (data_mean_bins - irf_mean_bins) * tpb_ns
+         # Exact SEM of the weighted-mean estimator, same formula as
+         # fitting.mean_arrival_time -- the IRF subtraction is a constant
+         # shift, so it doesn't add variance; only the data's own spread does.
+-        var_t = np.sum(y * (t_bins_c - data_mean_bins) ** 2) / N
++        var_t = np.sum(y * (t_bins_c - trunc_mean_bins) ** 2) / N
+         # Unlike fitting.mean_arrival_time's tail-only window (short, close
+         # to the mean it's centered on), this function's window runs the
+         # full pooled-cutoff range from bin 0 -- on real data, up to ~30 ns,
