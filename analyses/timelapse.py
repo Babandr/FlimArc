@@ -41,7 +41,7 @@ REQUIRES_RAW = True
 IRF_CAPABLE = True
 # Extra CLI/GUI settings this plugin needs beyond the common set (used by the
 # GUI to build its settings panel and metadata log generically).
-EXTRA_ARGS = ['step']
+EXTRA_ARGS = ['step', 'rolling_window']
 
 
 def preview_slice(loaded_data, settings):
@@ -96,6 +96,14 @@ def main():
     ap.add_argument("h5file", help="RAW Flimera .H5 photon-stream file (not an export/.ds3d project)")
     ap.add_argument("--step", type=float, default=None,
                     help="time window duration, in seconds (prompts if omitted)")
+    ap.add_argument("--rolling-window", type=int, default=1,
+                    help="temporal moving-average width, in steps (default 1 = no rolling). "
+                         "With N>1, each output time point pools photons from N consecutive "
+                         "step-sized windows centred on that time point, e.g. --step 1 "
+                         "--rolling-window 3 pools 3 s of photons per output point. "
+                         "The first and last floor(N/2) windows are dropped because they "
+                         "cannot form a full window; the remaining output points are labelled "
+                         "by the CENTRE window's time range so the x-axis is unaffected.")
     ap.add_argument("--threshold", type=int, default=None,
                     help="min photons/pixel for the mask, applied to EVERY window "
                          "(skips the interactive prompt after window 1's overview)")
@@ -289,12 +297,45 @@ def run(args):
     # of bincount calls, not a large allocation on its own).
     boundaries = window_boundaries(window_idx, n_windows)
 
+    # --- rolling-window (temporal moving average) setup ---
+    # With rw > 1, each output point pools photons from rw consecutive
+    # step-sized windows centred on the output window.  Because photons are
+    # sorted by time, this is just a wider contiguous slice -- no data copy.
+    # half = floor(rw/2) windows on the left; tail = rw - half on the right
+    # (so for odd rw both sides are equal; for even rw the right side is one
+    # wider).  Windows at the edges where the full context isn't available are
+    # skipped (strict mode), which is what the user asked for.
+    rw = max(1, int(getattr(args, "rolling_window", 1) or 1))
+    rw_half = rw // 2            # steps dropped at the START
+    rw_tail = rw - rw_half       # steps dropped at the END  (= rw_half+1 for even rw)
+    w_first  = rw_half               # first output window index (0-based)
+    w_last   = n_windows - rw_tail + 1  # exclusive upper bound (boundaries[w+rw_tail] must exist)
+    n_output = max(0, w_last - w_first)
+
+    # Enrich the output prefix with step size and rolling-window count so that
+    # output folders/files are self-documenting.  The ROI-preview overview
+    # written earlier uses the bare prefix (no step/rw context needed there).
+    step_tag = f"_step{step_s:g}s"
+    rw_tag   = f"_rw{rw}" if rw > 1 else ""
+    prefix   = f"{prefix}{step_tag}{rw_tag}"
+
+    if rw > 1:
+        print(f"  Rolling window = {rw} steps  ->  {n_output} output windows "
+              f"(first {rw_half} and last {rw_tail} step(s) dropped)")
+        if n_output == 0:
+            print(f"  ERROR: rolling window ({rw}) is larger than the number of windows "
+                  f"({n_windows}); reduce --rolling-window or increase the acquisition time.")
+            return
+
     def window_cube(w):
-        sel = slice(boundaries[w], boundaries[w + 1])
+        # Return the image/cube for output window w, pooling rw raw steps.
+        sel = slice(boundaries[w - rw_half], boundaries[w + rw_tail])
         return build_group_cube(d, sel)
 
-    img0, cube0 = window_cube(0)
-    print(f"  window 1/{n_windows} ({window_descs[0]}): {boundaries[1]-boundaries[0]} photons")
+    img0, cube0 = window_cube(w_first)
+    photons0 = boundaries[w_first + rw_tail] - boundaries[w_first - rw_half]
+    print(f"  window {w_first+1}/{n_windows} ({window_descs[w_first]}): {photons0} photons"
+          + (f" (pooled from {rw} steps)" if rw > 1 else ""))
 
     report_dead_pixels(img0)
 
@@ -303,7 +344,7 @@ def run(args):
     # produce for window 1 in the loop below, so this is a preview, not a duplicate file)
     if getattr(args, "save_overview", True):
         plot_overview(img0, f"{prefix}_group1of{n_windows}_overview.png", not args.no_show,
-                      title_suffix=f"  (window 1/{n_windows}: {window_descs[0]})")
+                      title_suffix=f"  (window {w_first+1}/{n_windows}: {window_descs[w_first]})")
 
     external_mask_path = getattr(args, "external_mask", None)
     external_mask = None
@@ -318,9 +359,10 @@ def run(args):
         else:
             nz = img0[img0 > 0]
             default = DEFAULT_THRESHOLD
-            print(f"\nChoose the mask threshold using window 1 ({window_descs[0]}) as reference.")
+            rw_note = f" ({rw} steps pooled)" if rw > 1 else ""
+            print(f"\nChoose the mask threshold using window {w_first+1} ({window_descs[w_first]}{rw_note}) as reference.")
             print(f"This SAME threshold will be applied to every other window automatically.")
-            print(f"(window 1 per-pixel photons: median {int(np.median(nz))}, "
+            print(f"(window {w_first+1} per-pixel photons: median {int(np.median(nz))}, "
                   f"90th pct {int(np.percentile(nz, 90))}; suggested default {default})")
             resp = input(f"Minimum photons/pixel [{default}]: ").strip()
             threshold = int(resp) if resp else default
@@ -337,14 +379,13 @@ def run(args):
     # per-window mask.
     irf_aligned = None
     if fit_method in ("irf", "mean_irf"):
-        whole_img = img0.astype(np.float64)
-        whole_cube = cube0.astype(np.float64)  # float64 accumulator: avoids
-                                                # precision loss summing
-                                                # hundreds of float32 cubes
-        for w in range(1, n_windows):
-            img_w, cube_w = window_cube(w)
-            whole_img += img_w
-            whole_cube += cube_w
+        # For IRF alignment we need the whole acquisition (all photons), not
+        # just the rolling output windows.  A single slice(None) across the
+        # entire sorted photon stream is equivalent to summing every raw step,
+        # and avoids building n_windows separate cubes just to add them up.
+        whole_img, whole_cube = build_group_cube(d, slice(None))
+        whole_img  = whole_img.astype(np.float64)
+        whole_cube = whole_cube.astype(np.float64)
         # Same spatial smoothing + time binning every group gets (so the IRF
         # alignment/reference fit see the same grid the per-group fits will);
         # d_ref / args_ref carry the post-binning tpb and bin for this block.
@@ -408,10 +449,12 @@ def run(args):
     # came from phase-wrapping or plain sequential chunking)
     results = []
     cancel_check = getattr(args, "cancel_check", None)
-    for w in range(n_windows):
+    for w in range(w_first, w_last):
         if cancel_check is not None and cancel_check():
-            raise AnalysisCancelled(f"Cancelled after {w}/{n_windows} windows.")
-        img_w, cube_w = (img0, cube0) if w == 0 else window_cube(w)
+            raise AnalysisCancelled(f"Cancelled after {w - w_first}/{n_output} windows.")
+        # Reuse the already-built cube for the first output window; rebuild the
+        # rest on demand so at most one rolling-window cube is in memory at once.
+        img_w, cube_w = (img0, cube0) if w == w_first else window_cube(w)
         r = process_group(w, n_windows, img_w, cube_w, d,
                           prefix, args, threshold, min_neighbors, window_descs[w],
                           irf_aligned=irf_aligned, external_mask=external_mask)
@@ -421,7 +464,7 @@ def run(args):
     if any(r is not None for r in results):
         plot_timelapse_summary(results, step_s, prefix, not args.no_show, args.mono)
 
-    print(f"\nDone. Processed {sum(r is not None for r in results)}/{n_windows} windows.")
+    print(f"\nDone. Processed {sum(r is not None for r in results)}/{n_output} windows.")
 
 
 if __name__ == "__main__":

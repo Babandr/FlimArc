@@ -83,9 +83,10 @@ from gui.decay_viewer import DecayViewer
 # entry here.
 # ----------------------------------------------------------------------------- #
 EXTRA_ARG_SPECS = {
-    "step":   ("Step size (s):", tk.DoubleVar, 5.0),
-    "period": ("Period (s):", tk.DoubleVar, 1.0),
-    "groups": ("Number of groups:", tk.IntVar, 5),
+    "step":           ("Step size (s):", tk.DoubleVar, 5.0),
+    "period":         ("Period (s):", tk.DoubleVar, 1.0),
+    "groups":         ("Number of groups:", tk.IntVar, 5),
+    "rolling_window": ("Rolling window (steps):", tk.IntVar, 1),
 }
 
 # Human-readable labels for the two other places in the GUI that pick

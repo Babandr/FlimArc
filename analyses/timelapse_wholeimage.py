@@ -44,7 +44,7 @@ NAME = 'Timelapse (whole image)'
 DESCRIPTION = 'Split into time windows, pool the masked region per window, fit one tau per window.'
 REQUIRES_RAW = True
 IRF_CAPABLE = True
-EXTRA_ARGS = ['step']
+EXTRA_ARGS = ['step', 'rolling_window']
 
 
 def preview_slice(loaded_data, settings):
@@ -99,6 +99,12 @@ def main():
     ap.add_argument("h5file", help="RAW Flimera .H5 photon-stream file (not an export/.ds3d project)")
     ap.add_argument("--step", type=float, default=None,
                     help="time window duration, in seconds (prompts if omitted)")
+    ap.add_argument("--rolling-window", type=int, default=1,
+                    help="temporal moving-average width, in steps (default 1 = no rolling). "
+                         "With N>1, each output time point pools photons from N consecutive "
+                         "step-sized windows centred on that time point. "
+                         "The first and last floor(N/2) windows are dropped because they "
+                         "cannot form a full window.")
     ap.add_argument("--threshold", type=int, default=None,
                     help="min photons/super-pixel (measured over the WHOLE acquisition) to include "
                          "in the mask (skips the interactive prompt)")
@@ -262,6 +268,31 @@ def run(args):
         window_descs.append(f"{t0:.2f}-{t1:.2f}s")
         window_t0.append(t0); window_t1.append(t1)
 
+    # --- rolling-window (temporal moving average) setup ---
+    rw = max(1, int(getattr(args, "rolling_window", 1) or 1))
+    rw_half = rw // 2
+    rw_tail = rw - rw_half
+    w_first  = rw_half
+    w_last   = n_windows - rw_tail + 1  # exclusive upper bound (boundaries[w+rw_tail] must exist)
+    n_output = max(0, w_last - w_first)
+
+    # Enrich the output prefix with step size and rolling-window count so that
+    # output folders/files are self-documenting.  The ROI-preview overview
+    # written earlier uses the bare prefix (no step/rw context needed there).
+    step_tag = f"_step{step_s:g}s"
+    rw_tag   = f"_rw{rw}" if rw > 1 else ""
+    prefix   = f"{prefix}{step_tag}{rw_tag}"
+
+    if rw > 1:
+        print(f"  Rolling window = {rw} steps  ->  {n_output} output windows "
+              f"(first {rw_half} and last {rw_tail} step(s) dropped)")
+        if n_output == 0:
+            print(f"  ERROR: rolling window ({rw}) is larger than the number of windows "
+                  f"({n_windows}); reduce --rolling-window or increase the acquisition time.")
+            return
+    else:
+        w_first, w_last, n_output = 0, n_windows, n_windows
+
     # --- mask is chosen ONCE, from the WHOLE acquisition (all photons, all
     # windows combined) -- not from a single window -- so every window sums
     # photons from exactly the same fixed set of super-pixels. ---
@@ -385,15 +416,18 @@ def run(args):
         tau_short_fixed = manual_tau_short if (args.fix_tau_short and manual_tau_short is not None) else None
 
     cancel_check = getattr(args, "cancel_check", None)
-    for w in range(n_windows):
+    for w in range(w_first, w_last):
         if cancel_check is not None and cancel_check():
-            raise AnalysisCancelled(f"Cancelled after {w}/{n_windows} windows.")
-        sel = slice(boundaries[w], boundaries[w + 1])
+            raise AnalysisCancelled(f"Cancelled after {w - w_first}/{n_output} windows.")
+        # Pool photons from rw raw steps centred on window w.
+        sel = slice(boundaries[w - rw_half], boundaries[w + rw_tail])
         img_w, cube_w = build_group_cube(d, sel)
         img_w, cube_w, _, _, _ = apply_spatial_and_time_binning(
             img_w, cube_w, d_native, args_native, allow_moving_average=False)
 
-        print(f"\n--- window {w+1}/{n_windows}  ({window_descs[w]}) ---")
+        out_idx = w - w_first + 1   # 1-based index within the output sequence
+        print(f"\n--- window {out_idx}/{n_output}  ({window_descs[w]})"
+              + (f"  [pooled steps {w - rw_half + 1}–{w + rw_tail}]" if rw > 1 else "") + " ---")
 
         if fit_method in ("mean", "mean_irf"):
             if args.mono:
@@ -414,17 +448,17 @@ def run(args):
             summed = cube_w[mask].sum(axis=0).astype(float)
             if getattr(args, "save_results", True):
                 plot_pooled_mean_arrival(summed, d["tpb"], tau_mean, tau_mean_std,
-                                         f"Window {w+1}/{n_windows} ({window_descs[w]}): "
+                                         f"Window {out_idx}/{n_output} ({window_descs[w]}): "
                                          f"pooled mean arrival time",
-                                         f"{prefix}_window{w+1}of{n_windows}_fit.png", show)
+                                         f"{prefix}_window{out_idx}of{n_output}_fit.png", show)
 
-            wprefix = f"{prefix}_window{w+1}of{n_windows}"
+            wprefix = f"{prefix}_window{out_idx}of{n_output}"
             np.savez(f"{wprefix}_maps.npz",
                      photons_per_pixel=img_w, mask=mask, n_photons=n_photons,
                      tau_mean_ns=tau_mean, tau_mean_std_ns=tau_mean_std,
                      window=w, n_windows=n_windows, window_desc=window_descs[w],
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=args.bin,
-                     fit_method=fit_method)
+                     fit_method=fit_method, rolling_window=rw)
             print(f"  saved {wprefix}_maps.npz")
             results.append(dict(val=tau_mean, n_photons=n_photons, tau_mean_std=tau_mean_std))
             continue
@@ -453,7 +487,7 @@ def run(args):
             val = g["tau"]
         else:
             if fit_method == "tail" and args.fix_tau_short and tau_short_fixed is None:
-                # First window, no manual value given, tail-fit mode: do the
+                # First output window, no manual value given, tail-fit mode: do the
                 # free fit (already just performed above) and pin its own
                 # tau_short for every subsequent window.
                 tau_short_fixed = g["tau_short"]
@@ -471,15 +505,15 @@ def run(args):
         if getattr(args, "save_results", True):
             if fit_method == "irf":
                 plot_window_fit_reconv(summed, d["tpb"], g, args.mono,
-                                       f"Window {w+1}/{n_windows} ({window_descs[w]}): pooled fit (IRF)",
-                                       f"{prefix}_window{w+1}of{n_windows}_fit.png", show)
+                                       f"Window {out_idx}/{n_output} ({window_descs[w]}): pooled fit (IRF)",
+                                       f"{prefix}_window{out_idx}of{n_output}_fit.png", show)
             else:
                 _, _, s_idx, tn = _tail_axis(s_like, summed[None, None, :], offset=getattr(args, "tail_start_offset", None))
                 plot_window_fit(summed, s_idx, tn, g, args.mono,
-                                f"Window {w+1}/{n_windows} ({window_descs[w]}): pooled fit",
-                                f"{prefix}_window{w+1}of{n_windows}_fit.png", show)
+                                f"Window {out_idx}/{n_output} ({window_descs[w]}): pooled fit",
+                                f"{prefix}_window{out_idx}of{n_output}_fit.png", show)
 
-        wprefix = f"{prefix}_window{w+1}of{n_windows}"
+        wprefix = f"{prefix}_window{out_idx}of{n_output}"
         if args.mono:
             print(f"  tau_std = {g.get('tau_std', float('nan')):.3f} ns")
             np.savez(f"{wprefix}_maps.npz",
@@ -487,7 +521,8 @@ def run(args):
                      tau_ns=g["tau"], tau_std_ns=g.get("tau_std", np.nan), model="mono",
                      window=w, n_windows=n_windows,
                      window_desc=window_descs[w], threshold=threshold,
-                     min_neighbors=min_neighbors, bin_size=args.bin, fit_method=fit_method)
+                     min_neighbors=min_neighbors, bin_size=args.bin, fit_method=fit_method,
+                     rolling_window=rw)
         else:
             print(f"  tau_short_std = {g.get('tau_short_std', float('nan')):.3f} ns, "
                   f"tau_long_std = {g.get('tau_long_std', float('nan')):.3f} ns")
@@ -497,19 +532,23 @@ def run(args):
                      tau_short_std_ns=g.get("tau_short_std", np.nan), tau_long_std_ns=g.get("tau_long_std", np.nan),
                      model="bi", window=w, n_windows=n_windows, window_desc=window_descs[w],
                      threshold=threshold, min_neighbors=min_neighbors, bin_size=args.bin,
-                     fit_method=fit_method)
+                     fit_method=fit_method, rolling_window=rw)
         print(f"  saved {wprefix}_maps.npz")
 
         results.append(dict(val=val, n_photons=n_photons, g=g))
 
-    x = np.array([(w + 0.5) * step_s for w in range(n_windows)])
+    # x-axis: centre time of each OUTPUT window (labelled by its centre step).
+    x = np.array([(w + 0.5) * step_s for w in range(w_first, w_last)])
+    out_descs = window_descs[w_first:w_last]
+    out_t0    = window_t0[w_first:w_last]
+    out_t1    = window_t1[w_first:w_last]
     symbol = "\u27e8t\u27e9" if fit_method in ("mean", "mean_irf") else ("\u03c4" if args.mono else "\u03c4_long")
-    plot_trend(results, window_descs, x, symbol, prefix, show)
-    save_trend_npz(results, window_t0, window_t1, x, args.mono, f"{prefix}_trend_summed.npz",
+    plot_trend(results, out_descs, x, symbol, prefix, show)
+    save_trend_npz(results, out_t0, out_t1, x, args.mono, f"{prefix}_trend_summed.npz",
                    fit_method=fit_method)
 
     n_ok = sum(r is not None for r in results)
-    print(f"\nDone. Fitted {n_ok}/{n_windows} windows.")
+    print(f"\nDone. Fitted {n_ok}/{n_output} windows.")
 
 
 if __name__ == "__main__":
