@@ -88,13 +88,15 @@ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
     histogram in the IRF measurement is shifted to remove its individual
     TDC timing offset BEFORE the per-pixel histograms are summed. This
     makes the integrated IRF kernel sharper and more representative of the
-    true single-pixel instrument response -- without correction, the sum of
-    ~21 k misaligned peaks broadens the apparent IRF peak by ~36% and
-    suppresses its amplitude by the same factor, causing the reconvolution
-    fit to systematically overestimate τ_short. Should always be set to the
-    same calibration file used to correct the data cube (see normal.py's
-    pixel_offset block) so that data and IRF kernel are corrected
-    consistently."""
+    true single-pixel instrument response.
+
+    Without correction, the sum of ~21 k misaligned peaks broadens the
+    apparent IRF FWHM by ~36-50% (measured: ~15 bins / 560 ps; expected
+    after correction: ~10 bins / 385 ps). The resulting broad kernel has
+    excess signal at 0.5-1.5 ns past the peak, causing the Poisson-deviance
+    optimizer to push tau_short to its lower bound -- a severe UNDERESTIMATE,
+    not an overestimate. Until a calibration is available, use
+    fit_method="tail" to get physically reasonable lifetime values."""
     s = load_flim_data(path)
     cube = build_decay_cube(s)
 
@@ -167,10 +169,24 @@ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
     raw_bs = np.clip(windowed, 0, None)
     irf_norm = raw_bs / raw_bs.sum()                    # unit-area kernel for convolution
 
+    fwhm_ns = fwhm_bins * tpb_ns
+    if fwhm_ns > 0.500 and pixel_offset_path is None:
+        import warnings
+        warnings.warn(
+            f"load_irf: IRF FWHM is {fwhm_ns*1000:.0f} ps ({fwhm_bins} bins), "
+            f"wider than the ~350-450 ps expected after per-pixel TDC-offset "
+            f"correction. Without correction, reconvolution fits push tau_short "
+            f"to its lower bound. Pass pixel_offset_path= to load_irf() and "
+            f"apply corr.apply() to the data cube. See flim_core/pixel_offset.py.",
+            stacklevel=2,
+        )
+
     return dict(raw=raw, irf_norm=irf_norm, tpb=s["tpb"], nb=len(raw),
-                peak_bin=peak_bin, fwhm_bins=fwhm_bins, bg_level=bg_level,
+                peak_bin=peak_bin, fwhm_bins=fwhm_bins, fwhm_ns=fwhm_ns,
+                bg_level=bg_level,
                 bg_fraction=bg_fraction, window=(left, right), echo_fraction=echo_fraction,
-                n_photons=s["n_photons"], source=s["source"], windowed=window)
+                n_photons=s["n_photons"], source=s["source"], windowed=window,
+                pixel_offset_corrected=(pixel_offset_path is not None))
 
 
 def shift_array(a, shift):
