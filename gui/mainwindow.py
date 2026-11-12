@@ -1441,6 +1441,8 @@ class FlimMasterApp(tk.Tk):
              for the whole-image variant (e.g. timelapse pixel-wise ->
              "_timelapse_pixel", timelapse whole-image -> "_timelapse",
              normal pixel-wise -> "_pixel", normal whole-image -> "").
+             Followed by plugin-specific tags from EXTRA_ARG_TAGS
+             ("_step{N}s", "_rw{N}", "_per{N}s", "_g{N}").
           2. binning: "_bin{N}"
           3. masking: "_thr{N}" for a threshold mask (the common case), or
              "_roi"/"_extmask" for the other two selection modes -- masking
@@ -1457,6 +1459,7 @@ class FlimMasterApp(tk.Tk):
             measurement = f"_{word}" if word else ""
         else:
             measurement = f"_{word}_pixel" if word else "_pixel"
+        measurement += self._extra_args_postfix(plugin_id, settings)
 
         if settings.get("moving_average"):
             binning = f"_ma{settings['moving_average']}"
@@ -1484,6 +1487,33 @@ class FlimMasterApp(tk.Tk):
             fit = "_mono" if settings["mono"] else "_biexp"
 
         return measurement + binning + masking + fit
+
+    # Folder-name tags for known plugin EXTRA_ARGS, in this fixed order.
+    # Each entry: (field name, formatter returning the tag or "" to omit).
+    # Fields not listed here (e.g. a future plugin's own field) are not put
+    # in the folder name -- they are still recorded in metadata.txt.
+    EXTRA_ARG_TAGS = (
+        ("step",           lambda v: f"_step{float(v):g}s"),
+        ("rolling_window", lambda v: f"_rw{int(v)}" if int(v) > 1 else ""),
+        ("period",         lambda v: f"_per{float(v):g}s"),
+        ("groups",         lambda v: f"_g{int(v)}"),
+    )
+
+    def _extra_args_postfix(self, plugin_id, settings):
+        """Tags for the plugin-specific settings that change the analysis
+        (timelapse step / rolling window, periodic period / groups), e.g.
+        "_step1s_rw3" or "_per0.5s_g5". Only fields the plugin actually
+        declares in EXTRA_ARGS are used."""
+        declared = self.plugins_by_id[plugin_id]["extra_args"]
+        extra = settings.get("extra", {})
+        out = ""
+        for name, fmt in self.EXTRA_ARG_TAGS:
+            if name in declared and extra.get(name) is not None:
+                try:
+                    out += fmt(extra[name])
+                except (TypeError, ValueError):
+                    out += f"_{name}{extra[name]}"
+        return out
 
     def run_analysis(self):
         if self.running:
@@ -1621,11 +1651,14 @@ class FlimMasterApp(tk.Tk):
             f"Run at:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Source file: {self.filepath}",
             f"File type:   {self.file_type}",
-            f"Plugin:      {plugin['name']}",
+            f"Plugin:      {plugin['name']} ({self.plugin_id})",
+            f"Output:      {out_folder}",
             "Settings:",
             (f"  moving_average: {settings['moving_average']}" if settings.get("moving_average")
              else f"  bin: {settings['bin']}"),
-            *([f"  time_bin: {settings['time_bin']}"] if settings.get("time_bin", 1) > 1 else []),
+            f"  time_bin: {settings['time_bin']}",
+            f"  pixel_offset_file: {settings['pixel_offset_path']}",
+            f"  bin_pattern_correction: {settings['bin_pattern']}",
             f"  selection_mode: {settings['selection_mode']}",
         ]
         if settings["selection_mode"] == "roi":
@@ -1647,11 +1680,14 @@ class FlimMasterApp(tk.Tk):
         if not is_mean:
             lines.append(f"  model: {'mono' if settings['mono'] else 'bi'}")
             lines.append(f"  lifetime_preset: {settings['lifetime_preset']}")
+            def _bounds(key, default):
+                b = settings[key]
+                return f"{b} ns" if b is not None else f"{default} ns (config default)"
             if settings["mono"]:
-                lines.append(f"  tau_mono_bounds: {settings['tau_mono_bounds']}")
+                lines.append(f"  tau_mono_bounds: {_bounds('tau_mono_bounds', TAU_MONO_BOUNDS)}")
             else:
-                lines.append(f"  tau_short_bounds: {settings['tau_short_bounds']}")
-                lines.append(f"  tau_long_bounds: {settings['tau_long_bounds']}")
+                lines.append(f"  tau_short_bounds: {_bounds('tau_short_bounds', TAU_SHORT_BOUNDS)}")
+                lines.append(f"  tau_long_bounds: {_bounds('tau_long_bounds', TAU_LONG_BOUNDS)}")
         lines.append(f"  fit_method: {settings['fit_method']}")
         if settings["fit_method"] in ("irf", "mean_irf"):
             lines.append(f"  irf_file: {settings['irf_path']}")
@@ -1669,6 +1705,8 @@ class FlimMasterApp(tk.Tk):
         for name in plugin["extra_args"]:
             lines.append(f"  {name}: {settings['extra'].get(name)}")
 
+        vlim = settings["lifetime_vlim"]
+        lines.append(f"  lifetime_plot_range_ns: {vlim if vlim is not None else 'auto'}")
         lines.append(f"  save_overview: {settings['save_overview']}")
         lines.append(f"  save_results: {settings['save_results']}")
         lines.append(f"  save_quality_plots: {settings['save_quality_plots']}")

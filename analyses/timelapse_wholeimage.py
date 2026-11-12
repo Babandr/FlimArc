@@ -276,12 +276,9 @@ def run(args):
     w_last   = n_windows - rw_tail + 1  # exclusive upper bound (boundaries[w+rw_tail] must exist)
     n_output = max(0, w_last - w_first)
 
-    # Enrich the output prefix with step size and rolling-window count so that
-    # output folders/files are self-documenting.  The ROI-preview overview
-    # written earlier uses the bare prefix (no step/rw context needed there).
-    step_tag = f"_step{step_s:g}s"
-    rw_tag   = f"_rw{rw}" if rw > 1 else ""
-    prefix   = f"{prefix}{step_tag}{rw_tag}"
+    # Step size and rolling-window count are NOT added to file names: the GUI
+    # puts them in the output folder name ("_step{N}s_rw{N}") and in
+    # metadata.txt, so files inside the folder keep the plain data-file stem.
 
     if rw > 1:
         print(f"  Rolling window = {rw} steps  ->  {n_output} output windows "
