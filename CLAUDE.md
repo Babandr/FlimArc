@@ -353,6 +353,11 @@ mask, decay_model, t0_ns, f_long, f_long_window, background_per_bin, irf_shift;
 single mode: tau_single, off_curve, curve_tau_ns/curve_G/curve_S, …),
 `_overview.png`, `_phasor_scatter.png`, `_phasor_maps.png`.
 
+Scatter plots draw the pixel cloud with `_draw_pixel_cloud` (bin size set by
+the axes, not the cloud -- a fixed 100x100 grid over a tight single-lifetime
+cloud made it invisible) and add a zoom inset (`_add_zoom_inset`) when the
+cloud is small. `phasor_timelapse` reuses the same helper.
+
 ---
 
 ## Phasor timelapse (`analyses/phasor_timelapse.py`)

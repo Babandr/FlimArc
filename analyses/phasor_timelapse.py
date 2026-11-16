@@ -193,10 +193,6 @@ def plot_trajectory(su, stacks, pooled, t_mid, prefix):
     if len(G_all) > 1:
         g_lo, g_hi = np.percentile(G_all, [0.5, 99.5])
         s_lo, s_hi = np.percentile(S_all, [0.5, 99.5])
-        if g_hi > g_lo and s_hi > s_lo:
-            h2d, xe, ye = np.histogram2d(G_all, S_all, bins=120, range=[[g_lo, g_hi], [s_lo, s_hi]])
-            ax.pcolormesh(xe, ye, np.where(h2d > 0, np.log1p(h2d), np.nan).T,
-                          cmap="Greys", alpha=0.6, zorder=1)
     else:
         g_lo = g_hi = s_lo = s_hi = np.nan
 
@@ -214,6 +210,7 @@ def plot_trajectory(su, stacks, pooled, t_mid, prefix):
     ax.set_xlim(min(pts_g) - pad, max(pts_g) + pad)
     ax.set_ylim(max(-0.02, min(pts_s) - pad), max(pts_s) + pad)
     ax.set_aspect("equal")
+    ph._draw_pixel_cloud(ax, G_all, S_all, cmap="Greys", alpha=0.6, zorder=1)
     ax.set_xlabel("G")
     ax.set_ylabel("S")
     irf_tag = " + IRF corr." if su.irf_shift is not None else ""

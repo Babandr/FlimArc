@@ -747,6 +747,91 @@ def fraction_long(G, S, G1, S1, G2, S2):
 # Plotting
 # ---------------------------------------------------------------------------
 
+def _draw_pixel_cloud(ax, G, S, cmap="viridis", alpha=0.9, zorder=3, bins_across=220):
+    """Log-density of pixel phasors with bins sized relative to the AXES (about
+    bins_across bins across the x-range), not to the cloud: a 100x100 grid
+    over a tight cloud (e.g. a single lifetime, spread ~0.03) makes every bin
+    smaller than a screen pixel and the cloud vanishes from the figure. Call
+    after the axis limits are set."""
+    ok = np.isfinite(G) & np.isfinite(S)
+    G, S = G[ok], S[ok]
+    if len(G) == 0:
+        return
+    x0, x1 = ax.get_xlim()
+    bw = (x1 - x0) / bins_across
+    g_lo, g_hi = np.percentile(G, [0.1, 99.9])
+    s_lo, s_hi = np.percentile(S, [0.1, 99.9])
+    xe = np.arange(g_lo - bw, g_hi + 2 * bw, bw)
+    ye = np.arange(s_lo - bw, s_hi + 2 * bw, bw)
+    h2d, xe, ye = np.histogram2d(G, S, bins=[xe, ye])
+    ax.pcolormesh(xe, ye, np.where(h2d > 0, np.log1p(h2d), np.nan).T,
+                  cmap=cmap, alpha=alpha, zorder=zorder)
+
+
+def _nice_tau_ticks(lo, hi, max_ticks=7):
+    """Round lifetime values (ns) between lo and hi for curve ticks."""
+    for step in (0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 5.0):
+        ticks = np.arange(np.ceil(lo / step) * step, hi + 1e-9, step)
+        if len(ticks) <= max_ticks:
+            return [round(x, 3) for x in ticks]
+    return []
+
+
+def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15):
+    """When the pixel cloud is small compared with the plot, add a zoomed
+    inset around it: pixel density, the single-lifetime curve (or universal
+    semicircle) with fine lifetime ticks, any reference points / tie-line,
+    and the cloud median. Returns the inset axes or None.
+
+    curve: (tau, G, S) or None (-> universal semicircle at this omega is
+    passed in as a curve by the caller). refs: [(G, S, marker, color, label)].
+    tie: ((G1, S1), (G2, S2)) or None."""
+    ok = np.isfinite(G) & np.isfinite(S)
+    G, S = G[ok], S[ok]
+    if len(G) < 2:
+        return None
+    x0, x1 = ax.get_xlim()
+    y0, y1 = ax.get_ylim()
+    g_lo, g_hi = np.percentile(G, [0.5, 99.5])
+    s_lo, s_hi = np.percentile(S, [0.5, 99.5])
+    if (g_hi - g_lo) > min_frac * (x1 - x0) or (s_hi - s_lo) > min_frac * (y1 - y0):
+        return None
+    gm, sm = float(np.median(G)), float(np.median(S))
+    half = 0.65 * max(g_hi - g_lo, s_hi - s_lo, 0.01)
+    zx, zy = (gm - half, gm + half), (sm - half, sm + half)
+
+    # put the inset in the lower part of the plot, away from the cloud
+    fx = (gm - x0) / (x1 - x0)
+    left = 0.06 if fx > 0.5 else 0.52
+    ins = ax.inset_axes([left, 0.06, 0.42, 0.42])
+    if curve is not None:
+        c_tau, c_G, c_S = curve
+        ins.plot(c_G, c_S, color="#7B1FA2", lw=1.2, zorder=2)
+        sel = (c_G > zx[0]) & (c_G < zx[1]) & (c_S > zy[0]) & (c_S < zy[1])
+        if sel.any():
+            for tau in _nice_tau_ticks(c_tau[sel].min(), c_tau[sel].max()):
+                Gt = np.interp(np.log(tau), np.log(c_tau), c_G)
+                St = np.interp(np.log(tau), np.log(c_tau), c_S)
+                ins.plot(Gt, St, "o", ms=3, color="#7B1FA2", zorder=2)
+                ins.annotate(f"{tau:g}", (Gt, St), textcoords="offset points", xytext=(4, 2),
+                             fontsize=6.5, color="#7B1FA2", zorder=7,
+                             bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
+    if tie is not None:
+        (G1, S1), (G2, S2) = tie
+        ins.plot([G1, G2], [S1, S2], "--", color="#E05C3A", lw=1.2, zorder=4)
+    for (Gr, Sr, mk, col, _lbl) in refs:
+        ins.plot(Gr, Sr, mk, mfc="none", mec=col, mew=1.5, ms=8, zorder=5)
+    ins.set_xlim(*zx)
+    ins.set_ylim(*zy)
+    ins.set_aspect("equal")
+    _draw_pixel_cloud(ins, G, S, bins_across=60)
+    ins.plot(gm, sm, "+", color="k", ms=9, mew=1.2, zorder=6)
+    ins.tick_params(labelsize=6)
+    ins.set_title("zoom (+ = median)", fontsize=7)
+    ax.indicate_inset_zoom(ins, edgecolor="#555555")
+    return ins
+
+
 def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
                         G1_ref=None, S1_ref=None, G2_ref=None, S2_ref=None,
                         show=True, curve=None, tau_ref=None, G_ref=None, S_ref=None):
@@ -802,19 +887,6 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
     xlim = (min(g_pts), max(g_pts))
     ylim = (min(s_pts), max(s_pts))
 
-    # Pixel density: log-scaled 2D histogram over the data's own extent
-    g_lo, g_hi = (np.percentile(G_px, [0.5, 99.5]) if len(G_px) else (0, 0))
-    s_lo, s_hi = (np.percentile(S_px, [0.5, 99.5]) if len(S_px) else (0, 0))
-    if len(G_px) > 1 and g_hi > g_lo and s_hi > s_lo:
-        h2d, xedg, yedg = np.histogram2d(
-            G_px, S_px, bins=100,
-            range=[[g_lo, g_hi], [s_lo, s_hi]])
-        h2d_plot = np.where(h2d > 0, np.log1p(h2d), np.nan)
-        ax.pcolormesh(xedg, yedg, h2d_plot.T,
-                      cmap="viridis", alpha=0.9, zorder=3)
-    else:
-        ax.scatter(G_px, S_px, s=4, c="#2196F3", alpha=0.6, zorder=3)
-
     # Reference points and tie-line (computed numerically for this window)
     if tau_ref1 is not None and tau_ref2 is not None and G1_ref is not None:
         ax.plot([G1_ref, G2_ref], [S1_ref, S2_ref], "--",
@@ -834,6 +906,20 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
     ax.set_xlabel("G  (cosine component)", fontsize=11)
     ax.set_ylabel("S  (sine component)", fontsize=11)
     ax.set_aspect("equal")
+
+    # Pixel density (after the limits: bin size follows the axes, see helper)
+    _draw_pixel_cloud(ax, G_px, S_px)
+    zoom_curve = curve
+    if zoom_curve is None:
+        tt = np.geomspace(0.01, 5 * T, 3000)
+        zoom_curve = (tt, 1 / (1 + (omega * tt) ** 2), omega * tt / (1 + (omega * tt) ** 2))
+    refs = []
+    if G1_ref is not None:
+        refs += [(G1_ref, S1_ref, "^", "#2196F3", ""), (G2_ref, S2_ref, "s", "#E05C3A", "")]
+    if G_ref is not None:
+        refs.append((G_ref, S_ref, "D", "#E05C3A", ""))
+    _add_zoom_inset(ax, G_px, S_px, curve=zoom_curve, refs=refs,
+                    tie=((G1_ref, S1_ref), (G2_ref, S2_ref)) if G1_ref is not None else None)
     irf_tag = " + IRF corr." if result.get("irf_corrected") else ""
     ax.set_title(f"Phasor plot  (harmonic {h}, T = {T:.2f} ns{irf_tag})", fontsize=12)
     ax.legend(fontsize=7, loc="upper right", framealpha=0.7)
