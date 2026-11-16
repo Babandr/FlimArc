@@ -279,8 +279,11 @@ def process_file(h5file, args):
             g = global_reconv_fit(signal_sum, irf_aligned, s["tpb"] * 1e9,
                                   tau_short_bounds=tau_short_bounds, tau_long_bounds=tau_long_bounds,
                                   no_shift=no_shift)
-            print(f"  global reconvolution fit (masked pixels only): tau_short = {g['tau_short']:.2f} ns, "
-                  f"tau_long = {g['tau_long']:.2f} ns")
+            print(f"  global reconvolution fit (masked pixels only, free reference fit): "
+                  f"tau_short = {g['tau_short']:.2f} ns, tau_long = {g['tau_long']:.2f} ns")
+            if args.fix_tau_short and manual_tau_short is not None:
+                print(f"    (reference only -- its tau_short is NOT used; the per-pixel fits below "
+                      f"pin tau_short = {manual_tau_short:.2f} ns)")
         if getattr(args, "save_irf_check", True):
             plot_irf_diagnostic(irf, signal_sum, shift, g, s["tpb"], f"{prefix}_irf_check.png", show,
                                 n_signal=int(mask.sum()), unit=unit)
@@ -391,8 +394,11 @@ def process_file(h5file, args):
         if args.mono:
             print(f"  global fit (mono-exponential): tau = {g['tau']:.2f} ns  (peak bin {peak_bin})")
         else:
-            print(f"  global fit: tau_short = {g['tau_short']:.2f} ns, "
+            print(f"  global fit (free reference fit): tau_short = {g['tau_short']:.2f} ns, "
                   f"tau_long = {g['tau_long']:.2f} ns  (peak bin {peak_bin})")
+            if args.fix_tau_short and manual_tau_short is not None:
+                print(f"    (reference only -- its tau_short is NOT used; the per-pixel fits below "
+                      f"pin tau_short = {manual_tau_short:.2f} ns)")
 
         if args.mono:
             if args.fix_tau_short:

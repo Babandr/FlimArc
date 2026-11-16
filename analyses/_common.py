@@ -412,12 +412,9 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
             g = global_reconv_fit(signal_sum, irf_aligned, d["tpb"] * 1e9,
                                   tau_short_bounds=tau_short_bounds, tau_long_bounds=tau_long_bounds,
                                   no_shift=no_shift)
-            print(f"  global reconvolution fit: tau_short = {g['tau_short']:.2f} ns, "
+            print(f"  global reconvolution fit (free reference fit): tau_short = {g['tau_short']:.2f} ns, "
                   f"tau_long = {g['tau_long']:.2f} ns")
-            if args.fix_tau_short:
-                tau_short_fixed = manual_tau_short if manual_tau_short is not None else g["tau_short"]
-            else:
-                tau_short_fixed = None
+            tau_short_fixed = _log_fixed_tau_short(args, manual_tau_short, g)
             fit = fit_pixels_reconv(cube, irf_aligned, d["tpb"] * 1e9, mask, tau_short_fixed,
                                     tau_short_bounds=tau_short_bounds, tau_long_bounds=tau_long_bounds,
                                     cancel_check=cancel_check, no_shift=no_shift)
@@ -487,11 +484,9 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
             fit = fit_pixels_mono(cube, s_idx, tn, mask, tau_mono_bounds=tau_mono_bounds,
                                   cancel_check=cancel_check)
         else:
-            print(f"  global fit: tau_short = {g['tau_short']:.2f} ns, tau_long = {g['tau_long']:.2f} ns")
-            if args.fix_tau_short:
-                tau_short_fixed = manual_tau_short if manual_tau_short is not None else g["tau_short"]
-            else:
-                tau_short_fixed = None
+            print(f"  global fit (free reference fit): tau_short = {g['tau_short']:.2f} ns, "
+                  f"tau_long = {g['tau_long']:.2f} ns")
+            tau_short_fixed = _log_fixed_tau_short(args, manual_tau_short, g)
             fit = fit_pixels(cube, s_idx, tn, mask, tau_short_fixed,
                              tau_short_bounds=tau_short_bounds, tau_long_bounds=tau_long_bounds,
                              cancel_check=cancel_check)
@@ -556,6 +551,21 @@ def process_group(g_idx, n_groups, img, cube, d, prefix, args, threshold, min_ne
 
     print(f"  saved {gprefix}_maps.npz")
     return dict(group=g_idx, median=summary_val, iqr=summary_iqr, n_pixels=int(mask.sum()))
+
+
+def _log_fixed_tau_short(args, manual_tau_short, g):
+    """Resolve the tau_short to pin in the per-pixel fits (None = free) and
+    log where it came from, so the free reference fit printed just before
+    isn't mistaken for the value actually used."""
+    if not getattr(args, "fix_tau_short", False):
+        return None
+    if manual_tau_short is not None:
+        print(f"    (reference only -- its tau_short is NOT used)")
+        tau_short_fixed, source = manual_tau_short, "manually set"
+    else:
+        tau_short_fixed, source = g["tau_short"], "from the free reference fit above"
+    print(f"  fixing tau_short = {tau_short_fixed:.2f} ns ({source}); floating only tau_long")
+    return tau_short_fixed
 
 
 def global_fit_fixed_short(summed, s, s_idx, tn, tau_short_fixed, tau_long_bounds=None,
