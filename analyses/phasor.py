@@ -384,54 +384,77 @@ def _build_time_axes(s, cube, rep_rate_mhz=None):
     return nb, tpb_ns, T_laser_ns, t_full
 
 
-def _reference_phasor(tau_ns, t_abs_win, t0_ns, T_laser_ns, harmonic=1):
-    """Phasor of a pure monoexponential decay seen through the same time
-    window as the data.  Returns (G_ref, S_ref, w_window).
+def _mono_phasors(taus_ns, t_abs_win, t0_ns, T_laser_ns, harmonic=1, continuous=False):
+    """Phasors of pure periodic monoexponential decays seen through the data's
+    window, for an array of lifetimes. Returns (G, S, w_window), each (n,).
 
-    The decay starts at t0_ns (the excitation time on the data's time axis)
-    and repeats every laser period, so the photons from the previous pulse
-    that are still arriving are included -- exactly what the camera records.
+    The decay starts at t0_ns on the data's time axis (left bin edges) and
+    repeats every laser period, so photons still arriving from the previous
+    pulse are included -- exactly what the camera records.
+
+    continuous=False (tail window, no IRF correction): the data are bin
+    counts -- integrals over each bin -- of the decay, transformed on the
+    left-edge axis. For an exponential a bin integral is exactly proportional
+    to the value at the bin's left edge, so point samples there reproduce the
+    data's phasor exactly.
+
+    continuous=True (IRF-corrected full window): dividing by the IRF phasor
+    removes the binning together with the IRF (both are binned the same way),
+    so the corrected phasor is that of the CONTINUOUS decay. Point samples
+    lag it by half a bin of phase (-w*tpb/2: +0.025 ns on tau at 50 ps bins,
+    +0.11 ns at 400 ps), so here each bin's decay is integrated exactly with
+    its phase: sum_k int_bin e^{-(t-t0)/tau} e^{iwt} dt = point-sample sum
+    times (e^{a*tpb} - 1)/a, a = -1/tau + iw.
+
+    w_window -- fraction of this component's photons (per laser period) inside
+    the window, from exact bin integrals: sum_k e^{-u_k/tau} (1 - e^{-tpb/tau})
+    / (1 - e^{-T/tau}). (value x bin width overstates it by ~tpb/(2 tau): ~10 %
+    for 1.4 ns at 300 ps bins). Converts window photon fractions back to
+    whole-decay fractions (see _window_to_total_fraction).
+    """
+    tau = np.atleast_1d(np.asarray(taus_ns, dtype=np.float64))
+    omega = 2.0 * np.pi * harmonic / T_laser_ns
+    tpb_ns = (t_abs_win[1] - t_abs_win[0]) if len(t_abs_win) > 1 else 0.0
+    u = np.mod(t_abs_win - t0_ns, T_laser_ns)                        # time since the latest pulse
+    with np.errstate(over="ignore", under="ignore"):
+        e = np.exp(-u[None, :] / tau[:, None])                        # (n, n_win)
+    tot = e.sum(axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = (e * np.exp(1j * omega * t_abs_win)[None, :]).sum(axis=1) / tot
+        if continuous and tpb_ns > 0:
+            a = -1.0 / tau + 1j * omega
+            z = z * np.expm1(a * tpb_ns) / (a * tau * -np.expm1(-tpb_ns / tau))
+        w_window = tot * -np.expm1(-tpb_ns / tau) / -np.expm1(-T_laser_ns / tau)
+    return z.real, z.imag, w_window
+
+
+def _reference_phasor(tau_ns, t_abs_win, t0_ns, T_laser_ns, harmonic=1, continuous=False):
+    """Phasor of one pure monoexponential decay through the data's window --
+    see _mono_phasors. Returns (G_ref, S_ref, w_window).
 
     Needed for the tie-line and f_long projection: a tail-only (or
     shorter-than-period) window moves a pure lifetime's phasor off the
     universal semicircle, so the reference must be computed numerically with
-    the same window to be consistent with the measured pixel phasors.
-
-    w_window -- fraction of this component's photons (per laser period) that
-    fall inside the window. Converts window photon fractions back to
-    whole-decay intensity fractions (see _window_to_total_fraction).
-    """
-    omega = 2.0 * np.pi * harmonic / T_laser_ns
-    u = np.mod(t_abs_win - t0_ns, T_laser_ns)               # time since the latest pulse
-    p = np.exp(-u / tau_ns) / (1.0 - np.exp(-T_laser_ns / tau_ns))
-    tpb_ns = (t_abs_win[1] - t_abs_win[0]) if len(t_abs_win) > 1 else 0.0
-    w_window = float(np.sum(p) * tpb_ns / tau_ns)           # integral over a period = 1
-    h_ref = p / p.sum()                                      # normalise; only shape matters
-    G_ref = float(np.sum(h_ref * np.cos(omega * t_abs_win)))
-    S_ref = float(np.sum(h_ref * np.sin(omega * t_abs_win)))
-    return G_ref, S_ref, w_window
+    the same window to be consistent with the measured pixel phasors."""
+    G, S, w = _mono_phasors([tau_ns], t_abs_win, t0_ns, T_laser_ns, harmonic, continuous)
+    return float(G[0]), float(S[0]), float(w[0])
 
 
 def single_lifetime_curve(t_abs_win, t0_ns, T_laser_ns, harmonic=1,
-                          tau_min_ns=0.01, n=4000):
+                          tau_min_ns=0.01, n=4000, continuous=False):
     """The single-lifetime curve for this window: phasors of pure periodic
-    monoexponential decays (same construction as _reference_phasor) for a
-    log-spaced grid of lifetimes. Returns (tau, G, S), tau increasing.
+    monoexponential decays (same construction as _reference_phasor, see
+    _mono_phasors) for a log-spaced grid of lifetimes. Returns (tau, G, S),
+    tau increasing.
 
-    In IRF-corrected full-window mode this is the universal semicircle (up
-    to bin sampling); for a tail window it is a different curve, which is why
-    it is computed numerically rather than from 1/(1 + i w tau)."""
+    In IRF-corrected full-window mode this is the universal semicircle (when
+    the window spans the laser period); for a tail window it is a different
+    curve, which is why it is computed numerically rather than from
+    1/(1 + i w tau)."""
     tau = np.geomspace(tau_min_ns, 5.0 * T_laser_ns, n)
-    omega = 2.0 * np.pi * harmonic / T_laser_ns
-    u = np.mod(t_abs_win - t0_ns, T_laser_ns)                       # (n_win,)
-    with np.errstate(over="ignore", under="ignore"):
-        p = np.exp(-u[None, :] / tau[:, None])                       # (n, n_win)
-    tot = p.sum(axis=1)
-    ok = np.isfinite(tot) & (tot > 0)
-    tau, p, tot = tau[ok], p[ok], tot[ok]
-    G = (p * np.cos(omega * t_abs_win)).sum(axis=1) / tot
-    S = (p * np.sin(omega * t_abs_win)).sum(axis=1) / tot
-    return tau, G, S
+    G, S, _w = _mono_phasors(tau, t_abs_win, t0_ns, T_laser_ns, harmonic, continuous)
+    ok = np.isfinite(G) & np.isfinite(S)
+    return tau[ok], G[ok], S[ok]
 
 
 def project_on_curve(G, S, mask, curve_tau, curve_G, curve_S, chunk=4096):
@@ -590,10 +613,11 @@ def irf_timing_shift(signal_sum, irf_grid, tpb_ns, no_shift=False):
     timing definition. The fit's shift includes the model's +0.5-bin
     sampling convention (see flim_core.irf._BIN_CONVENTION_SHIFT); it is
     removed here, so the value returned is the PHYSICAL offset. Dividing by
-    the IRF rotated by the physical offset leaves the decay phasor as if
-    sampled at bin CENTRES -- a close match to the continuous decay
-    (tau_phase/tau_mod), and how the reference phasors are computed in this
-    mode. With no_shift the physical offset is held at 0.
+    the IRF rotated by the physical offset leaves the phasor of the
+    CONTINUOUS decay starting at t = 0 (the binning divides out with the
+    IRF), which is how the reference phasors are computed in this mode
+    (_mono_phasors, continuous=True). With no_shift the physical offset is
+    held at 0.
 
     Returns the shift, or None if the fit fails (correction then skipped
     rather than applied with a wrong offset).
@@ -609,6 +633,41 @@ def irf_timing_shift(signal_sum, irf_grid, tpb_ns, no_shift=False):
     except Exception as exc:
         print(f"  WARNING: reconvolution fit for the IRF timing offset failed ({exc}).")
     return None
+
+
+def irf_offset_binned(args, signal_fine, tpb_fine_ns, time_bin, irf_binned=None):
+    """IRF/data timing offset (physical, see irf_timing_shift) in units of the
+    TIME-BINNED grid, measured at NATIVE time resolution.
+
+    The reconvolution model is only accurate when bins are much narrower than
+    the IRF: with time_bin > 1 its free shift absorbs model error (on
+    noise-free synthetic data, 0.25 ns IRF: -199 ps at 400 ps bins, +281 ps at
+    200 ps; true 0). A time shift is the same in ns on any grid, and the data
+    and the IRF are both binned from their own first bin, so the offset fitted
+    on the unbinned pooled decay and unbinned IRF converts exactly:
+    offset_binned = offset_native / time_bin.
+
+    signal_fine: pooled masked decay BEFORE time binning. irf_binned: the IRF
+    already loaded at time_bin == 1 (reused then; otherwise it is reloaded
+    unbinned). Returns the offset in binned bins, or None if the fit fails."""
+    no_shift = getattr(args, "no_shift", False)
+    if no_shift:
+        print("  IRF/data timing offset held at 0 (no_shift).")
+        return 0.0
+    if time_bin > 1 or irf_binned is None:
+        from flim_core.irf import load_irf
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            irf_f = load_irf(args.irf, window=not getattr(args, "irf_full", False),
+                             window_end_ns=getattr(args, "irf_window_end_ns", 15.0), time_bin=1,
+                             pixel_offset_path=getattr(args, "pixel_offset", None))
+    else:
+        irf_f = irf_binned
+    print("  Measuring the IRF/data timing offset (one pooled reconvolution fit"
+          + (", at native time resolution" if time_bin > 1 else "") + ") ...")
+    grid = _irf_on_data_grid(irf_f["irf_norm"], len(signal_fine))
+    sh = irf_timing_shift(np.asarray(signal_fine, dtype=float), grid, tpb_fine_ns)
+    return None if sh is None else sh / time_bin
 
 
 def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1):
@@ -921,6 +980,7 @@ def process_file(h5file, args):
     raw_offset = getattr(args, "tail_start_offset", None)
     if raw_offset is None:
         raw_offset = TAIL_START_OFFSET
+    cube_fine, tpb_fine_ns = cube, s["tpb"] * 1e9      # unbinned, for the IRF offset fit
     if time_bin > 1:
         cube, tpb_binned = bin_time_cube(cube, time_bin, s["tpb"])
         s = dict(s)
@@ -1005,12 +1065,9 @@ def process_file(h5file, args):
         print("  NOTE: IRF file ignored -- IRF correction needs the full window "
               "(fit_method='irf').")
     elif irf is not None:
-        no_shift = getattr(args, "no_shift", False)
         irf_grid = _irf_on_data_grid(irf["irf_norm"], nb)
-        signal_sum = cube[mask].sum(axis=0).astype(float)
-        print("  Measuring the IRF/data timing offset (one pooled reconvolution fit) ..."
-              if not no_shift else "  IRF/data timing offset held at 0 (no_shift).")
-        irf_shift = irf_timing_shift(signal_sum, irf_grid, tpb_ns, no_shift=no_shift)
+        irf_shift = irf_offset_binned(args, cube_fine[mask].sum(axis=0), tpb_fine_ns,
+                                      time_bin, irf_binned=irf)
         if irf_shift is None:
             print("  WARNING: IRF correction skipped -- the timing offset could not be "
                   "measured, and correcting with a wrong offset would bias every lifetime.")
@@ -1032,6 +1089,8 @@ def process_file(h5file, args):
         apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic)
         result["irf_shift_bins"] = irf_shift
 
+    del cube_fine
+
     # ---- reference phasor points and f_long ----
     G1_ref = S1_ref = G2_ref = S2_ref = None
     f_long_map = f_long_win_map = None
@@ -1040,16 +1099,17 @@ def process_file(h5file, args):
     curve = tau_single_map = off_curve_map = None
 
     # Excitation time on the data's time axis. After IRF correction the
-    # decay is referenced to the IRF's own time origin, as sampled at bin
-    # centres (see irf_timing_shift) -- hence -half a bin on this
-    # left-edge time axis. Without it, the decay peak is used -- a slight
-    # approximation, because the true excitation is a little earlier than
-    # the peak (by roughly the IRF rise), which slightly biases the
-    # tail-window weights.
-    t0_ns = -0.5 * tpb_ns if result["irf_corrected"] else (peak_bin - s["B0"]) * tpb_ns
+    # decay starts at the IRF's time origin, t = 0, and the reference is the
+    # continuous decay (see _mono_phasors). Without it, the decay peak is
+    # used -- a slight approximation, because the true excitation is a little
+    # earlier than the peak (by roughly the IRF rise), which slightly biases
+    # the tail-window weights.
+    irf_corr = result["irf_corrected"]
+    t0_ns = 0.0 if irf_corr else (peak_bin - s["B0"]) * tpb_ns
 
     if decay_model == "single":
-        curve = single_lifetime_curve(t_abs_win, t0_ns, T_laser_ns, harmonic)
+        curve = single_lifetime_curve(t_abs_win, t0_ns, T_laser_ns, harmonic,
+                                      continuous=irf_corr)
         print(f"  Projecting pixels onto the single-lifetime curve (this window, "
               f"decay start t0={t0_ns:.2f} ns) ...")
         tau_single_map, off_curve_map = project_on_curve(
@@ -1058,7 +1118,8 @@ def process_file(h5file, args):
         if n_end:
             print(f"    {n_end} pixel(s) lie beyond the ends of the curve -> NaN")
         if tau_ref is not None:
-            G_ref, S_ref, _w = _reference_phasor(tau_ref, t_abs_win, t0_ns, T_laser_ns, harmonic)
+            G_ref, S_ref, _w = _reference_phasor(tau_ref, t_abs_win, t0_ns, T_laser_ns, harmonic,
+                                                 continuous=irf_corr)
             print(f"    tau_ref={tau_ref} ns -> G={G_ref:.4f}, S={S_ref:.4f}")
         for lbl, arr in (("tau_single", tau_single_map), ("off_curve", off_curve_map)):
             v = arr[np.isfinite(arr)]
@@ -1067,8 +1128,10 @@ def process_file(h5file, args):
                       f"[{np.percentile(v, 2):.4f} to {np.percentile(v, 98):.4f}]")
 
     if tau_ref1 is not None and tau_ref2 is not None:
-        G1_ref, S1_ref, w1 = _reference_phasor(tau_ref1, t_abs_win, t0_ns, T_laser_ns, harmonic)
-        G2_ref, S2_ref, w2 = _reference_phasor(tau_ref2, t_abs_win, t0_ns, T_laser_ns, harmonic)
+        G1_ref, S1_ref, w1 = _reference_phasor(tau_ref1, t_abs_win, t0_ns, T_laser_ns, harmonic,
+                                               continuous=irf_corr)
+        G2_ref, S2_ref, w2 = _reference_phasor(tau_ref2, t_abs_win, t0_ns, T_laser_ns, harmonic,
+                                               continuous=irf_corr)
         print(f"  Reference phasors (this window, decay start t0={t0_ns:.2f} ns):")
         print(f"    tau_short={tau_ref1} ns -> G={G1_ref:.4f}, S={S1_ref:.4f}, "
               f"{w1*100:.1f}% of its photons in the window")

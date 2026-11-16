@@ -394,13 +394,25 @@ def run(args):
     # ---- whole acquisition: mask, axes, IRF offset, background ----
     img_all, cube_all = build_group_cube(d, slice(None))
     report_dead_pixels(img_all)
-    img_all, cube_all, d_b, args_b, _ = apply_spatial_and_time_binning(
-        img_all.astype(np.float64), cube_all.astype(np.float64), d, args)
-    tail_offset = args_b.tail_start_offset
-    if tail_offset is None:
-        from flim_core.config import TAIL_START_OFFSET
-        tail_offset = TAIL_START_OFFSET
-    s = dict(tpb=d_b["tpb"], B0=d_b["B0"], B1=d_b["B1"])
+    # spatial smoothing first, time binning separately: the unbinned cube is
+    # needed for the IRF offset fit (see ph.irf_offset_binned)
+    time_bin = getattr(args, "time_bin", None) or 1
+    args_fine = copy.copy(args)
+    args_fine.time_bin = 1
+    img_all, cube_fine, _d, args_b, _ = apply_spatial_and_time_binning(
+        img_all.astype(np.float64), cube_all.astype(np.float64), d, args_fine)
+    del cube_all
+    from flim_core.config import TAIL_START_OFFSET
+    from flim_core.masking import bin_time_cube
+    tail_offset = getattr(args, "tail_start_offset", None)
+    tail_offset = TAIL_START_OFFSET if tail_offset is None else tail_offset
+    tpb_fine_ns = d["tpb"] * 1e9
+    if time_bin > 1:
+        cube_all, tpb_b = bin_time_cube(cube_fine, time_bin, d["tpb"])
+        tail_offset = max(1, round(tail_offset / time_bin))   # keep the ns margin constant
+    else:
+        cube_all, tpb_b = cube_fine, d["tpb"]
+    s = dict(tpb=tpb_b, B0=d["B0"], B1=d["B0"] + cube_all.shape[2] - 1)
 
     per_window_img = img_all * (rw / n_windows)       # photons per pixel per OUTPUT window
     ext = getattr(args, "external_mask", None)
@@ -444,11 +456,8 @@ def run(args):
             print(f"  WARNING: data bin width ({s['tpb']:.3e} s) differs from the IRF's "
                   f"({irf['tpb']:.3e} s) -- the IRF phasor will not match this data.")
         su.irf_grid = ph._irf_on_data_grid(irf["irf_norm"], nb)
-        no_shift = getattr(args, "no_shift", False)
-        print("  Measuring the IRF/data timing offset on the whole acquisition ..."
-              if not no_shift else "  IRF/data timing offset held at 0 (no_shift).")
-        su.irf_shift = ph.irf_timing_shift(cube_all[mask].sum(axis=0).astype(float), su.irf_grid,
-                                           su.tpb_ns, no_shift=no_shift)
+        su.irf_shift = ph.irf_offset_binned(args, cube_fine[mask].sum(axis=0), tpb_fine_ns,
+                                            time_bin, irf_binned=irf)
         if su.irf_shift is None:
             print("  WARNING: IRF correction skipped -- the timing offset could not be measured.")
         else:
@@ -458,18 +467,22 @@ def run(args):
                 print("  WARNING: the histogram window is shorter than the laser period -- "
                       "IRF correction is approximate.")
     irf_corrected = su.irf_shift is not None
+    del cube_fine
 
-    t0_ns = -0.5 * su.tpb_ns if irf_corrected else (peak_bin - s["B0"]) * su.tpb_ns
+    t0_ns = 0.0 if irf_corrected else (peak_bin - s["B0"]) * su.tpb_ns   # see phasor.py
     su.curve = su.refs = None
     su.G_ref = su.S_ref = None
     if su.decay_model == "single":
-        su.curve = ph.single_lifetime_curve(su.t_abs_win, t0_ns, su.T, su.harmonic)
+        su.curve = ph.single_lifetime_curve(su.t_abs_win, t0_ns, su.T, su.harmonic,
+                                            continuous=irf_corrected)
         if su.tau_ref is not None:
             su.G_ref, su.S_ref, _ = ph._reference_phasor(su.tau_ref, su.t_abs_win, t0_ns, su.T,
-                                                         su.harmonic)
+                                                         su.harmonic, continuous=irf_corrected)
     elif su.tau_ref1 is not None:
-        G1, S1, w1 = ph._reference_phasor(su.tau_ref1, su.t_abs_win, t0_ns, su.T, su.harmonic)
-        G2, S2, w2 = ph._reference_phasor(su.tau_ref2, su.t_abs_win, t0_ns, su.T, su.harmonic)
+        G1, S1, w1 = ph._reference_phasor(su.tau_ref1, su.t_abs_win, t0_ns, su.T, su.harmonic,
+                                          continuous=irf_corrected)
+        G2, S2, w2 = ph._reference_phasor(su.tau_ref2, su.t_abs_win, t0_ns, su.T, su.harmonic,
+                                          continuous=irf_corrected)
         su.refs = (G1, S1, w1, G2, S2, w2)
     else:
         print("  NOTE: no reference lifetimes -- tracking G/S and tau_phase only"

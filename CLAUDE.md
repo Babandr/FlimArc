@@ -308,15 +308,27 @@ Science conventions — keep these when editing:
   intensity fraction using each reference lifetime's in-window share.
 - **Reference phasors** are computed numerically through the same window,
   from a *periodic* decay (repeats every laser period) starting at the decay
-  peak — not from the analytic semicircle. In IRF-corrected mode they start
-  at the IRF origin, sampled at bin centres (`t0 = −½ bin`).
+  peak — not from the analytic semicircle. Tail mode: point samples at left
+  bin edges (exact, since a bin integral of an exponential is proportional
+  to its left-edge value). IRF-corrected mode: the decay starts at `t0 = 0`
+  and each bin is integrated exactly *with its phase* (`continuous=True` in
+  `_mono_phasors`) -- dividing by the IRF phasor removes the binning, so the
+  corrected phasor is the continuous decay's; point samples lag it by half
+  a bin (was +0.025 ns on tau at 50 ps bins, +0.11 ns at 400 ps).
+- **In-window photon share** `w_window` uses exact bin integrals
+  (`1 - e^{-tpb/tau}`), not value x bin width (~10 % high for 1.4 ns at
+  300 ps bins, biasing `f_long`).
 - **Background** can't be read from the last bins: at 80 MHz a 4.3 ns
   component is still decaying there (~60 % of those counts are signal, varying
   per pixel). Instead each pixel's tail is solved linearly as
   `a1·p1 + a2·p2 + B` with fixed lifetimes (refs, else a pooled `global_fit`);
   only `B` is used. Skipped with a warning if ill-conditioned.
 - **IRF correction** = `z_data / (z_irf · e^{iω·offset})`, with `offset` the
-  physical offset from one pooled `global_reconv_fit`. Valid only for
+  physical offset from one pooled `global_reconv_fit`, **fitted at native
+  time resolution** (`irf_offset_binned`) and divided by `time_bin`. The
+  reconvolution model is inaccurate when bins approach the IRF width (on
+  synthetic data: -199 ps at 400 ps bins, true 0), so never fit the offset
+  on time-binned data. Check: IRF-mode results must not depend on `time_bin`. Valid only for
   the full window (`fit_method="irf"`), exact only when the histogram
   window spans one full laser period (warns otherwise). If the offset can't be
   measured, the correction is skipped rather than applied with a wrong offset.
