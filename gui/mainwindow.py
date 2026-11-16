@@ -892,6 +892,7 @@ class FlimMasterApp(tk.Tk):
         # ── 8-bin TDC clock pattern correction (self-calibrating) ────────────────
         f_bp = ttk.LabelFrame(parent, text="8-bin pattern correction")
         f_bp.pack(fill="x", pady=(0, 8))
+        self.bin_pattern_frame = f_bp
 
         self.bin_pattern_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
@@ -1041,6 +1042,8 @@ class FlimMasterApp(tk.Tk):
             hidden.add(self.model_frame)
         if not opts["uses_lifetime_range"]:
             hidden.add(self.lifetime_range_frame)
+        if not opts["uses_bin_pattern"]:
+            hidden.add(self.bin_pattern_frame)
         for w, _ in self._right_sections:
             w.pack_forget()
         for w, info in self._right_sections:
@@ -1830,7 +1833,8 @@ class FlimMasterApp(tk.Tk):
              else f"  bin: {settings['bin']}"),
             f"  time_bin: {settings['time_bin']}",
             f"  pixel_offset_file: {settings['pixel_offset_path']}",
-            f"  bin_pattern_correction: {settings['bin_pattern']}",
+            *([f"  bin_pattern_correction: {settings['bin_pattern']}"]
+              if plugin["gui"]["uses_bin_pattern"] else []),
             f"  selection_mode: {settings['selection_mode']}",
         ]
         if settings["selection_mode"] == "roi":

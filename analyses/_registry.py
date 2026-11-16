@@ -58,6 +58,8 @@ GUI_OPTION_DEFAULTS = dict(
     uses_model=True,
     # False = hide Lifetime display range (args.lifetime_vlim unused).
     uses_lifetime_range=True,
+    # False = hide 8-bin pattern correction (args.bin_pattern unused).
+    uses_bin_pattern=True,
     # Which args.save_* output toggles the plugin honours.
     outputs=("save_overview", "save_results", "save_quality_plots", "save_irf_check"),
 )

@@ -72,6 +72,7 @@ Any key left out keeps its default (`analyses/_registry.py`,
 | `tail_offset_with_irf` | `False` | Keep "Tail start offset" visible in IRF modes |
 | `uses_model` | `True` | `False` hides Model / preset / bounds (and the model tag in the folder name) |
 | `uses_lifetime_range` | `True` | `False` hides Lifetime display range |
+| `uses_bin_pattern` | `True` | `False` hides 8-bin pattern correction |
 | `outputs` | all four `save_*` | Which output toggles the plugin honours |
 
 The GUI must stay plugin-agnostic: hide sections from this metadata, never
@@ -341,6 +342,26 @@ single mode: tau_single, off_curve, curve_tau_ns/curve_G/curve_S, …),
 `_overview.png`, `_phasor_scatter.png`, `_phasor_maps.png`.
 
 ---
+
+## Phasor timelapse (`analyses/phasor_timelapse.py`)
+
+Raw files only. Same windows as `timelapse.py` (`step`, `rolling_window`) plus
+all phasor `EXTRA_ARGS`; reuses the maths in `analyses/phasor.py` (import it,
+don't copy it). Per window: pixel maps (`f_long`, `tau_single`/`off_curve`, or
+`tau_phase`) and one pooled whole-mask phasor.
+
+Measured **once on the whole acquisition** and reused for every window: the
+fixed pixel mask (threshold = photons per pixel per output window, averaged),
+time axes, tail start, `t0`, reference phasors / single-lifetime curve, the
+IRF offset, and the background (scaled to each window by its duration --
+assumes a constant background rate). Pixel offset is applied to photons
+(integer bins), so the 8-bin pattern correction is unsupported and hidden.
+Check: one window spanning the whole run reproduces `phasor.py` (G/S within
+~2e-4).
+
+Outputs: `_maps.npz` (stacks `[n_windows, H, W]`, `pooled_*` traces,
+`t_start_s`/`t_end_s`/`t_mid_s`, …), `_overview.png`,
+`_phasor_trajectory.png`, `_phasor_timecourse.png`, `_phasor_frames.png`.
 
 ## Output conventions
 
