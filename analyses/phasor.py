@@ -70,6 +70,25 @@ The phasor frequency is the laser repetition rate. If it is not given, the
 period is ASSUMED equal to the histogram window (nb * bin width); give the
 real repetition rate whenever the two differ.
 
+Background subtraction (subtract_background, default on)
+--------------------------------------------------------
+Uncorrelated counts (dark counts, ambient light) spread evenly over time.
+They pull every phasor toward the background's own phasor (the origin for a
+full-period window), lowering the modulation and biasing f_long. A flat
+level B per pixel per bin is subtracted before the transform:
+
+    G + iS = sum((n_k - B) e^{i w t_k}) / sum(n_k - B)
+
+B cannot simply be read from the last bins: when the decay has not finished
+within the laser period (e.g. a 4.3 ns component at 80 MHz) most of those
+counts are real decay, and how much varies from pixel to pixel. Instead,
+each pixel's tail bins are described as a1*p1 + a2*p2 + B with p1, p2 the
+periodic decay shapes of two fixed lifetimes (tau_ref1/tau_ref2 if given,
+else a pooled biexponential fit). With the lifetimes fixed this is linear,
+so all pixels are solved in one least-squares step -- no optimizer, and B
+is unbiased. The decay amplitudes are discarded; the phasor itself stays
+model-free.
+
 Outputs (per input file)
 -------------------------
   <prefix>_phasor_scatter.png   -- 2D density phasor plot
@@ -92,7 +111,7 @@ from flim_core.masking import (
     clean_mask, bin_cube, bin_time_cube, moving_average_cube, crop_to_roi,
     report_dead_pixels, load_mask,
 )
-from flim_core.fitting import _tail_axis
+from flim_core.fitting import _tail_axis, global_fit
 from flim_core.plotting import plot_overview_and_mask
 from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.bin_pattern import BinPatternCorrection
@@ -107,7 +126,8 @@ REQUIRES_RAW = False   # works on raw, exported, and .ds3d alike
 IRF_CAPABLE = True     # optional IRF file for phasor-space correction
 # Rendered by the GUI as plain text entries (values arrive as str, possibly
 # empty) -- parsed by _extra_args() below. Empty = default.
-EXTRA_ARGS = ["harmonic", "window_mode", "tau_ref1", "tau_ref2", "rep_rate_mhz"]
+EXTRA_ARGS = ["harmonic", "window_mode", "tau_ref1", "tau_ref2", "rep_rate_mhz",
+              "subtract_background"]
 
 
 def _extra_args(args):
@@ -137,7 +157,86 @@ def _extra_args(args):
     rep_rate_mhz = _num("rep_rate_mhz", float, None)
     if rep_rate_mhz is not None and rep_rate_mhz <= 0:
         raise ValueError(f"rep_rate_mhz must be > 0, got {rep_rate_mhz}")
-    return harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz
+    sb = getattr(args, "subtract_background", None)
+    if sb is None or (isinstance(sb, str) and not sb.strip()):
+        subtract_bg = True
+    elif isinstance(sb, str):
+        if sb.strip().lower() in ("1", "true", "yes", "y", "on"):
+            subtract_bg = True
+        elif sb.strip().lower() in ("0", "false", "no", "n", "off"):
+            subtract_bg = False
+        else:
+            raise ValueError(f"subtract_background = {sb!r}: use yes/no")
+    else:
+        subtract_bg = bool(sb)
+    return harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz, subtract_bg
+
+
+def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
+    """Per-pixel flat background level (counts per bin), [H, W].
+
+    In the tail bins (past the IRF-dominated rise) every masked pixel is
+    described as  n_k = a1 * p1(t_k) + a2 * p2(t_k) + B,  where p1, p2 are
+    the periodic decay shapes of the two lifetimes (starting at the decay
+    peak, repeating every laser period) and a1, a2, B are free per pixel.
+    With the lifetimes fixed this is LINEAR, so all pixels are solved at once
+    by one least-squares solve -- no optimizer.
+
+    taus: (tau_short, tau_long) in ns -- the reference lifetimes if given,
+    otherwise taken from one biexponential + background fit of the pooled
+    masked decay (global_fit).
+
+    The two decay terms are only there to separate B from the decay; their
+    amplitudes are not used. B is NOT clipped at 0: clipping keeps only the
+    positive half of the noise and biases every result.
+
+    Returns (B or None, info dict).
+    """
+    nb = cube.shape[2]
+    tpb_ns = s["tpb"] * 1e9
+    pooled = cube[mask].sum(axis=0).astype(float)
+    _, peak_bin, s_idx, tn = _tail_axis(s, pooled[None, None, :], offset=tail_offset)
+    info = dict(taus=None, n_tail_bins=nb - s_idx)
+    if nb - s_idx < 10:
+        print("  WARNING: fewer than 10 tail bins -- background subtraction skipped.")
+        return None, info
+
+    if taus is None:
+        try:
+            g = global_fit(pooled, s, s_idx, tn, mono=False, fit_background=True)
+            taus = (float(g["tau_short"]), float(g["tau_long"]))
+            src = "pooled biexponential fit"
+        except Exception as exc:
+            print(f"  WARNING: pooled fit for the background estimate failed ({exc}); "
+                  f"background subtraction skipped.")
+            return None, info
+    else:
+        src = "reference lifetimes"
+    info["taus"] = taus
+
+    t0_ns = (peak_bin - s["B0"]) * tpb_ns
+    t_tail = np.arange(s_idx, nb) * tpb_ns
+    u = np.mod(t_tail - t0_ns, T_laser_ns)
+    cols = [np.exp(-u / tau) / (1.0 - np.exp(-T_laser_ns / tau)) for tau in taus]
+    X = np.column_stack(cols + [np.ones_like(u)])
+    X_scaled = X / np.linalg.norm(X, axis=0)            # column scaling for the condition check
+    cond = np.linalg.cond(X_scaled)
+    if cond > 1e4:
+        print(f"  WARNING: background cannot be told apart from the decay in this window "
+              f"(condition number {cond:.0f}); background subtraction skipped.")
+        return None, info
+
+    Y = cube[mask][:, s_idx:].astype(np.float64).T       # (n_tail, n_pixels)
+    coef, *_ = np.linalg.lstsq(X, Y, rcond=None)
+    B = np.zeros(cube.shape[:2])
+    B[mask] = coef[2]
+
+    n_tot = cube[mask].sum(axis=1)
+    frac = coef[2] * nb / np.where(n_tot > 0, n_tot, np.nan)
+    print(f"  Background: per-pixel fit in the tail (decay shapes {taus[0]:.2f} / "
+          f"{taus[1]:.2f} ns from {src}): median {np.median(coef[2]):.2f} counts/bin "
+          f"= {100 * np.nanmedian(frac):.1f}% of all photons")
+    return B, info
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +325,7 @@ def _window_to_total_fraction(f_win, w_short, w_long):
         return (a_long / (a_long + a_short)).astype(np.float32)
 
 
-def compute_phasor(cube, t_abs_window, T_laser_ns, mask, harmonic=1):
+def compute_phasor(cube, t_abs_window, T_laser_ns, mask, harmonic=1, bg_per_bin=None):
     """Compute per-pixel phasor coordinates (G, S) from TCSPC histograms.
 
     Parameters
@@ -241,6 +340,9 @@ def compute_phasor(cube, t_abs_window, T_laser_ns, mask, harmonic=1):
         Full laser period in ns (determines the fundamental frequency).
     mask : ndarray bool, shape (H, W)
     harmonic : int
+    bg_per_bin : ndarray (H, W) or None
+        Flat background level subtracted from every bin before the
+        transform (see estimate_background). n_photons stays the raw count.
 
     Returns
     -------
@@ -251,9 +353,11 @@ def compute_phasor(cube, t_abs_window, T_laser_ns, mask, harmonic=1):
     omega = 2.0 * np.pi * harmonic / T_laser_ns
 
     h = cube.astype(np.float64)             # (H, W, n_window)
-    total = h.sum(axis=2)                   # (H, W)
-    n_photons = total.copy()
+    n_photons = h.sum(axis=2)               # raw counts, before background subtraction
     n_photons[~mask] = np.nan
+    if bg_per_bin is not None:
+        h = h - bg_per_bin[:, :, None]
+    total = h.sum(axis=2)                   # (H, W) signal photons
 
     with np.errstate(invalid='ignore', divide='ignore'):
         inv_total = np.where(total > 0, 1.0 / total, np.nan)
@@ -496,7 +600,7 @@ def plot_phasor_maps(result, mask, prefix, f_long=None, tau_ref1=None,
 
 def process_file(h5file, args):
     """Load → mask → phasor → plot → save pipeline for one file."""
-    harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz = _extra_args(args)
+    harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz, subtract_bg = _extra_args(args)
     show = not getattr(args, "no_show", True)
 
     stem   = Path(h5file).stem
@@ -620,18 +724,28 @@ def process_file(h5file, args):
 
     # Choose window
     if window_mode == "full":
-        cube_win  = cube                            # (H, W, nb)
-        t_abs_win = t_full                          # ns
+        win_slice = slice(None)
         win_label = f"full ({nb} bins)"
     else:
-        cube_win  = cube[:, :, s_tail_start:]       # (H, W, nb - s_tail_start)
-        t_abs_win = t_full[s_tail_start:]           # ns
-        win_label = f"tail ({len(t_abs_win)} bins, start bin {s_tail_start})"
+        win_slice = slice(s_tail_start, None)
+        win_label = f"tail ({nb - s_tail_start} bins, start bin {s_tail_start})"
+    cube_win  = cube[:, :, win_slice]
+    t_abs_win = t_full[win_slice]                   # ns
+
+    # ---- background ----
+    bg_map, bg_info = None, None
+    if subtract_bg:
+        bg_map, bg_info = estimate_background(
+            cube, mask, s, tail_offset, T_laser_ns,
+            taus=(tau_ref1, tau_ref2) if tau_ref1 is not None else None)
+    else:
+        print("  Background subtraction off.")
 
     # ---- compute phasor ----
     print(f"  Phasor: harmonic={harmonic}, window='{window_mode}' [{win_label}], "
           f"T={T_laser_ns:.2f} ns ...")
-    result = compute_phasor(cube_win, t_abs_win, T_laser_ns, mask, harmonic=harmonic)
+    result = compute_phasor(cube_win, t_abs_win, T_laser_ns, mask, harmonic=harmonic,
+                            bg_per_bin=bg_map)
     result["irf_corrected"] = False
 
     # ---- optional IRF correction ----
@@ -722,7 +836,11 @@ def process_file(h5file, args):
         moving_average   = (moving_avg or 1),
         time_bin         = time_bin,
         photons_per_pixel = img,
+        background_subtracted = np.bool_(bg_map is not None),
     )
+    if bg_map is not None:
+        save_kw["background_per_bin"] = bg_map.astype(np.float32)
+        save_kw["background_taus_ns"] = np.array(bg_info["taus"], dtype=np.float64)
     if f_long_map is not None:
         save_kw["f_long"]     = f_long_map
         save_kw["f_long_window"] = f_long_win_map
@@ -789,6 +907,9 @@ def main():
     p.add_argument("--rep-rate-mhz", type=float, default=None,
                    help="Laser repetition rate (MHz). Default: assume the period "
                         "equals the histogram window")
+    p.add_argument("--no-subtract-background", dest="subtract_background",
+                   action="store_false",
+                   help="Skip the flat-background subtraction (default: subtract)")
 
     # IRF correction
     p.add_argument("--irf", default=None,
