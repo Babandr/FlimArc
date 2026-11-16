@@ -162,7 +162,7 @@ class PixelOffsetCorrection:
         if meta:
             print(f"  [pixel_offset]   source: {meta.get('source_file','?')} "
                   f"| {meta.get('exposure_s','?')} s "
-                  f"| noise σ ≈ {meta.get('noise_sigma_ps','?')} ps")
+                  f"| noise sigma ~ {meta.get('noise_sigma_ps','?')} ps")
 
         return cls(offset_ps, tpb_ps, source=str(path), meta=meta)
 
@@ -238,7 +238,7 @@ class PixelOffsetCorrection:
                 n_corrected += 1
 
         print(f"  [pixel_offset] applied to {n_corrected} pixels "
-              f"({self.n_nan} skipped — no calibration data)")
+              f"({self.n_nan} skipped - no calibration data)")
         return out.astype(cube.dtype)
 
     # ------------------------------------------------------------------
@@ -251,7 +251,7 @@ class PixelOffsetCorrection:
         return (
             f"PixelOffsetCorrection | source: {Path(self.source).name} "
             f"| shape {self.offset_ps.shape} "
-            f"| σ={np.std(v):.1f} ps, range=[{v.min():.0f}, {v.max():.0f}] ps "
+            f"| sigma={np.std(v):.1f} ps, range=[{v.min():.0f}, {v.max():.0f}] ps "
             f"| valid={self.valid_mask.sum()}/{self.offset_ps.size}"
         )
 
