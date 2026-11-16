@@ -33,13 +33,15 @@ IRF correction (--irf, optional)
 ---------------------------------
 In phasor space, IRF correction is a single complex division:
 
-    z_corrected = (G + i·S) / (G_irf + i·S_irf)
+    z_corrected = (G + i·S) / (z_irf · exp(i·w·shift))
 
 This removes the phase shift and modulation attenuation introduced by the
-finite IRF width.  When used with --window-mode full it restores points
-to the universal semicircle (for a monoexponential decay).  With
---window-mode tail, it corrects the residual IRF contribution to the tail
-region.
+finite IRF width.  The IRF file and the data generally have a timing offset
+(separate acquisitions, cabling); it is measured with one reconvolution fit
+of the pooled masked decay -- the same fit the reconvolution plugins use --
+and applied as the exp(...) rotation. With --no-shift the offset is held at
+zero.  Only valid with --window-mode full (skipped for 'tail'); it restores
+points to the universal semicircle for a monoexponential decay.
 
 For tracking RELATIVE lifetime changes in a timelapse on the same
 instrument, IRF correction is optional -- the bias is constant across
@@ -112,6 +114,8 @@ from flim_core.masking import (
     report_dead_pixels, load_mask,
 )
 from flim_core.fitting import _tail_axis, global_fit
+from flim_core.config import IRF_SHIFT_SEARCH
+from flim_core.irf import global_reconv_fit, _BIN_CONVENTION_SHIFT
 from flim_core.plotting import plot_overview_and_mask
 from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.bin_pattern import BinPatternCorrection
@@ -392,39 +396,78 @@ def compute_phasor(cube, t_abs_window, T_laser_ns, mask, harmonic=1, bg_per_bin=
     )
 
 
-def apply_irf_correction(result, irf_dict, t_abs_window, harmonic=1):
-    """Correct phasor maps for IRF by complex division.
+def _irf_on_data_grid(irf_norm, nb):
+    """The IRF kernel padded with zeros / truncated to the data's bin count,
+    so it shares the data's bin grid (load_irf's kernel is compact -- zero
+    outside the main peak -- so padding adds nothing)."""
+    k = np.zeros(nb)
+    n = min(nb, len(irf_norm))
+    k[:n] = irf_norm[:n]
+    return k
 
-    z_corrected = (G + iS) / (G_irf + iS_irf)
 
-    The IRF's phasor is computed numerically from irf_dict["irf_norm"] using
-    absolute times that align the IRF peak with the data's time axis (the IRF
-    peak is placed at the absolute time corresponding to irf_dict["peak_bin"]).
+def irf_timing_shift(signal_sum, irf_grid, tpb_ns, no_shift=False):
+    """Timing offset between the IRF file and the data, in bins, as the
+    reconvolution model defines it (data = shift(IRF (x) decay, shift)).
 
+    Measured with ONE biexponential reconvolution fit of the pooled masked
+    decay (flim_core.irf.global_reconv_fit, free sub-bin shift) -- the same
+    fit the reconvolution plugins use, so the phasor and the fits share one
+    timing definition. The fit's shift includes the model's +0.5-bin
+    sampling convention (see flim_core.irf._BIN_CONVENTION_SHIFT); it is
+    removed here, so the value returned is the PHYSICAL offset. Dividing by
+    the IRF rotated by the physical offset leaves the decay phasor as if
+    sampled at bin CENTRES -- a close match to the continuous decay
+    (tau_phase/tau_mod), and how the reference phasors are computed in this
+    mode. With no_shift the physical offset is held at 0.
+
+    Returns the shift, or None if the fit fails (correction then skipped
+    rather than applied with a wrong offset).
+    """
+    if no_shift:
+        return 0.0
+    try:
+        g = global_reconv_fit(signal_sum, irf_grid, tpb_ns)
+        shift = float(g["shift"])
+        if np.isfinite(shift) and abs(shift) < IRF_SHIFT_SEARCH:
+            return shift - _BIN_CONVENTION_SHIFT
+        print(f"  WARNING: fitted IRF timing offset {shift:.1f} bins is at the search limit.")
+    except Exception as exc:
+        print(f"  WARNING: reconvolution fit for the IRF timing offset failed ({exc}).")
+    return None
+
+
+def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1):
+    """Correct phasor maps for the IRF by complex division:
+
+        z_decay = z_data / (z_irf * exp(i w shift tpb))
+
+    For periodic data recorded over one full laser period, the data
+    histogram is the circular convolution of the decay with the IRF as it
+    sits on the DATA's time axis. The IRF file's kernel is offset from that
+    by shift_bins, the physical offset (see irf_timing_shift); a time shift is a pure rotation in
+    phasor space, so it is applied as the exp(...) factor -- exact, no
+    resampling. Without it, an offset of d ns rotates every corrected phasor
+    by w*d and biases tau_phase by roughly d (plus a modulation error).
+
+    irf_grid: IRF kernel on the data's bin grid (_irf_on_data_grid).
     Modifies result dict in-place (G, S, modulation, tau_phase, tau_mod).
     """
     T = result["T_laser_ns"]
     omega = 2.0 * np.pi * harmonic / T
-    tpb_irf_ns = irf_dict["tpb"] * 1e9
-    irf_h = irf_dict["irf_norm"].astype(np.float64)
-    n_irf = len(irf_h)
-
-    # Align IRF to data: use the IRF's own bin indices as absolute time,
-    # so the IRF peak sits at irf_dict["peak_bin"] * tpb_irf_ns on its axis.
-    # This is an approximation (the true data/IRF timing offset is fitted in
-    # reconvolution -- here we use the peak as reference), but sufficient for
-    # removing the dominant IRF phase contribution.
-    t_irf = np.arange(n_irf) * tpb_irf_ns
+    irf_h = irf_grid.astype(np.float64)
+    t_irf = np.arange(len(irf_h)) * tpb_ns
 
     total_irf = irf_h.sum()
     if total_irf == 0:
         raise ValueError("IRF histogram is all zeros -- cannot compute IRF phasor.")
-    G_irf = float(np.sum(irf_h * np.cos(omega * t_irf)) / total_irf)
-    S_irf = float(np.sum(irf_h * np.sin(omega * t_irf)) / total_irf)
-    z_irf = complex(G_irf, S_irf)
+    z_irf = complex(np.sum(irf_h * np.cos(omega * t_irf)) / total_irf,
+                    np.sum(irf_h * np.sin(omega * t_irf)) / total_irf)
+    z_irf *= np.exp(1j * omega * shift_bins * tpb_ns)      # move the IRF onto the data's timing
     if abs(z_irf) < 1e-10:
         raise ValueError("IRF phasor magnitude ~0 -- check IRF file or harmonic.")
-    print(f"    IRF phasor: G={G_irf:.4f}, S={S_irf:.4f}, |z|={abs(z_irf):.4f}")
+    print(f"    IRF phasor (aligned): G={z_irf.real:.4f}, S={z_irf.imag:.4f}, "
+          f"|z|={abs(z_irf):.4f}")
 
     z = result["G"] + 1j * result["S"]
     z_corr = z / z_irf
@@ -755,8 +798,24 @@ def process_file(h5file, args):
         # phasor is not, so the division would give a wrong (G, S).
         print("  NOTE: IRF correction skipped -- it is only valid with window_mode='full'.")
     elif irf is not None:
-        print("  Applying IRF correction in phasor space ...")
-        apply_irf_correction(result, irf, t_abs_win, harmonic=harmonic)
+        no_shift = getattr(args, "no_shift", False)
+        irf_grid = _irf_on_data_grid(irf["irf_norm"], nb)
+        signal_sum = cube[mask].sum(axis=0).astype(float)
+        print("  Measuring the IRF/data timing offset (one pooled reconvolution fit) ..."
+              if not no_shift else "  IRF/data timing offset held at 0 (no_shift).")
+        irf_shift = irf_timing_shift(signal_sum, irf_grid, tpb_ns, no_shift=no_shift)
+        if irf_shift is None:
+            print("  WARNING: IRF correction skipped -- the timing offset could not be "
+                  "measured, and correcting with a wrong offset would bias every lifetime.")
+        else:
+            print(f"    IRF/data timing offset: {irf_shift:+.2f} bins "
+                  f"({irf_shift * tpb_ns * 1000:+.0f} ps; positive = data lag the IRF)")
+            if nb * tpb_ns < 0.99 * T_laser_ns:
+                print("  WARNING: the histogram window is shorter than the laser period, "
+                      "so the data are not one full period -- IRF correction is approximate.")
+            print("  Applying IRF correction in phasor space ...")
+            apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic)
+            result["irf_shift_bins"] = irf_shift
     elif window_mode == "full":
         print("  NOTE: 'full' window without --irf -- G/S include IRF phase "
               "contribution.  Results are valid for relative comparisons.")
@@ -768,11 +827,13 @@ def process_file(h5file, args):
 
     if tau_ref1 is not None and tau_ref2 is not None:
         # Excitation time on the data's time axis. After IRF correction the
-        # decay is referenced to the IRF's own time origin (bin 0). Without
-        # it, the decay peak is used -- a slight approximation, because the
-        # true excitation is a little earlier than the peak (by roughly the
-        # IRF rise), which slightly biases the tail-window weights.
-        t0_ns = 0.0 if result["irf_corrected"] else (peak_bin - s["B0"]) * tpb_ns
+        # decay is referenced to the IRF's own time origin, as sampled at bin
+        # centres (see irf_timing_shift) -- hence -half a bin on this
+        # left-edge time axis. Without it, the decay peak is used -- a slight
+        # approximation, because the true excitation is a little earlier than
+        # the peak (by roughly the IRF rise), which slightly biases the
+        # tail-window weights.
+        t0_ns = -0.5 * tpb_ns if result["irf_corrected"] else (peak_bin - s["B0"]) * tpb_ns
         G1_ref, S1_ref, w1 = _reference_phasor(tau_ref1, t_abs_win, t0_ns, T_laser_ns, harmonic)
         G2_ref, S2_ref, w2 = _reference_phasor(tau_ref2, t_abs_win, t0_ns, T_laser_ns, harmonic)
         print(f"  Reference phasors (this window, decay start t0={t0_ns:.2f} ns):")
@@ -838,6 +899,8 @@ def process_file(h5file, args):
         photons_per_pixel = img,
         background_subtracted = np.bool_(bg_map is not None),
     )
+    if "irf_shift_bins" in result:
+        save_kw["irf_shift"] = np.float64(result["irf_shift_bins"])   # physical offset, bins
     if bg_map is not None:
         save_kw["background_per_bin"] = bg_map.astype(np.float32)
         save_kw["background_taus_ns"] = np.array(bg_info["taus"], dtype=np.float64)
@@ -914,6 +977,8 @@ def main():
     # IRF correction
     p.add_argument("--irf", default=None,
                    help="IRF measurement file for phasor-space correction")
+    p.add_argument("--no-shift", action="store_true",
+                   help="Assume no IRF/data timing offset instead of measuring it")
     p.add_argument("--irf-full", action="store_true",
                    help="Keep full IRF trace (echoes); default: window to main peak")
     p.add_argument("--irf-window-end-ns", type=float, default=15.0,
