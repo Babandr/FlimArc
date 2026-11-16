@@ -76,7 +76,12 @@ from gui.decay_viewer import DecayViewer
 # ----------------------------------------------------------------------------- #
 # The only place a "new kind of plugin setting" needs to be taught anything.
 # Maps a field name (as it appears in a plugin's EXTRA_ARGS) to how to show
-# it: (label text, tk Var class, default value). A field name not listed
+# it: (label text, tk Var class, default value[, options]). options is an
+# optional dict: "kind" = "entry" (default) | "check" | "choice", "choices"
+# for a dropdown ("labels" = {value: shown text} to show friendlier text),
+# "hint" for a small grey note under the field, "show_if" = (other field,
+# value) to show the field only while that other field has that value
+# (hidden fields are also left out of metadata.txt). A field name not listed
 # here still gets a working (generic) text-entry widget -- see
 # _build_plugin_settings_widgets -- so a brand new plugin never breaks the
 # GUI, it just gets a slightly less polished widget until someone adds an
@@ -87,6 +92,28 @@ EXTRA_ARG_SPECS = {
     "period":         ("Period (s):", tk.DoubleVar, 1.0),
     "groups":         ("Number of groups:", tk.IntVar, 5),
     "rolling_window": ("Rolling window (steps):", tk.IntVar, 1),
+    # phasor
+    "harmonic":       ("Harmonic:", tk.IntVar, 1,
+                       {"kind": "choice", "choices": [1, 2, 3]}),
+    "rep_rate_mhz":   ("Laser rep. rate (MHz):", tk.StringVar, "",
+                       {"hint": "Blank = assume the period equals the histogram window."}),
+    "subtract_background": ("Subtract background", tk.BooleanVar, True, {"kind": "check"}),
+    "decay_model":    ("Decay model:", tk.StringVar, "bi",
+                       {"kind": "choice", "choices": ["bi", "single"],
+                        "labels": {"bi": "Two lifetimes", "single": "Single lifetime"}}),
+    "tau_ref":        ("Ref. tau (ns):", tk.StringVar, "",
+                       {"show_if": ("decay_model", "single"),
+                        "hint": "Single lifetime: each pixel gets tau_single (lifetime on the "
+                                "single-lifetime curve) and off_curve (distance from it -- "
+                                "check it before trusting tau). Ref. tau is optional, only "
+                                "marked on the plot."}),
+    "tau_ref1":       ("Ref. tau short (ns):", tk.StringVar, "",
+                       {"show_if": ("decay_model", "bi")}),
+    "tau_ref2":       ("Ref. tau long (ns):", tk.StringVar, "",
+                       {"show_if": ("decay_model", "bi"),
+                        "hint": "Optional: both give the tie-line and f_long, and fix the "
+                                "lifetimes used for background subtraction (blank = a "
+                                "pooled biexponential fit with default bounds)."}),
 }
 
 # Human-readable labels for the two other places in the GUI that pick
@@ -372,14 +399,18 @@ class FlimMasterApp(tk.Tk):
         self.save_results_var = tk.BooleanVar(value=True)
         self.save_quality_var = tk.BooleanVar(value=True)
         self.save_irf_check_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(output_frame, variable=self.save_overview_var,
-                       text="Overview / mask preview plot").pack(anchor="w", padx=8, pady=(6, 2))
-        ttk.Checkbutton(output_frame, variable=self.save_results_var,
-                       text="Results plot (lifetime map)").pack(anchor="w", padx=8, pady=2)
-        ttk.Checkbutton(output_frame, variable=self.save_quality_var,
-                       text="Fit-quality diagnostic plot").pack(anchor="w", padx=8, pady=2)
-        ttk.Checkbutton(output_frame, variable=self.save_irf_check_var,
-                       text="IRF check plot").pack(anchor="w", padx=8, pady=(2, 6))
+        # Shown/hidden per plugin from its GUI_OPTIONS["outputs"] (see _apply_plugin_gui).
+        toggles = ttk.Frame(output_frame)
+        toggles.pack(fill="x", pady=(4, 4))
+        self._output_toggles = {}   # args.save_* name -> Checkbutton
+        for name, var, text in (
+                ("save_overview", self.save_overview_var, "Overview / mask preview plot"),
+                ("save_results", self.save_results_var, "Results plot (lifetime map)"),
+                ("save_quality_plots", self.save_quality_var, "Fit-quality diagnostic plot"),
+                ("save_irf_check", self.save_irf_check_var, "IRF check plot")):
+            b = ttk.Checkbutton(toggles, variable=var, text=text)
+            b.pack(anchor="w", padx=8, pady=2)
+            self._output_toggles[name] = b
         ttk.Label(output_frame, text="The underlying data (.npz) is always saved --\n"
                  "these only control which plots get written.",
                  foreground="#777", font=("", 8), wraplength=220, justify="left").pack(
@@ -472,6 +503,12 @@ class FlimMasterApp(tk.Tk):
         self.status_label = ttk.Label(right, text="", foreground="#555", wraplength=240)
         self.status_label.pack(fill="x", padx=8)
 
+        # Every section in the settings column, in order, with its pack options,
+        # so sections a plugin doesn't use can be hidden and later re-packed in
+        # the same place (see _apply_plugin_gui).
+        self._right_sections = [(w, {k: v for k, v in w.pack_info().items() if k != "in"})
+                                for w in right.pack_slaves()]
+
         bottom = ttk.LabelFrame(self, text="Log")
         bottom.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
         self.log_box = scrolledtext.ScrolledText(bottom, height=9, state="disabled", font=("Courier", 9))
@@ -483,23 +520,92 @@ class FlimMasterApp(tk.Tk):
     def _build_plugin_settings_widgets(self):
         self.extra_vars = {}          # field name -> tk Var, shared across plugins that reuse a name
         self._extra_frames = {}       # frozenset(field names) -> frame, one per distinct shape
+        self._conditional_rows = []   # (widgets, controlling field, value) -- see "show_if"
 
-        shapes = {frozenset(p["extra_args"]) for p in self.plugins}
-        for shape in shapes:
+        # One frame per shape, fields in the order the (first) plugin declares them.
+        shapes = {}
+        for p in self.plugins:
+            shapes.setdefault(frozenset(p["extra_args"]), list(p["extra_args"]))
+        for shape, fields in shapes.items():
             if not shape:
                 continue
             frame = ttk.LabelFrame(self.plugin_settings_frame, text="Plugin settings")
-            for row, field in enumerate(sorted(shape)):
-                label, var_cls, default = EXTRA_ARG_SPECS.get(field, (f"{field}:", tk.StringVar, ""))
+            row = 0
+            for field in fields:
+                spec = EXTRA_ARG_SPECS.get(field, (f"{field}:", tk.StringVar, ""))
+                label, var_cls, default = spec[:3]
+                opts = spec[3] if len(spec) > 3 else {}
+                kind = opts.get("kind", "entry")
                 if field not in self.extra_vars:
                     self.extra_vars[field] = var_cls(value=default)
-                ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=4, pady=4)
-                ttk.Entry(frame, textvariable=self.extra_vars[field], width=10).grid(
-                    row=row, column=1, padx=4)
+                var = self.extra_vars[field]
+                row_widgets = []
+                if kind == "check":
+                    w = ttk.Checkbutton(frame, text=label, variable=var)
+                    w.grid(row=row, column=0, columnspan=2, sticky="w", padx=4, pady=4)
+                    row_widgets.append(w)
+                else:
+                    w = ttk.Label(frame, text=label)
+                    w.grid(row=row, column=0, sticky="w", padx=4, pady=4)
+                    row_widgets.append(w)
+                    if kind == "choice":
+                        w = self._build_choice_combobox(frame, var, opts)
+                    else:
+                        w = ttk.Entry(frame, textvariable=var, width=10)
+                    w.grid(row=row, column=1, sticky="w", padx=4)
+                    row_widgets.append(w)
+                row += 1
+                if opts.get("hint"):
+                    w = ttk.Label(frame, text=opts["hint"], foreground="#777", font=("", 8),
+                                  wraplength=230, justify="left")
+                    w.grid(row=row, column=0, columnspan=2, sticky="w", padx=4)
+                    row_widgets.append(w)
+                    row += 1
+                if opts.get("show_if"):
+                    other, value = opts["show_if"]
+                    self._conditional_rows.append((row_widgets, other, value))
             self._extra_frames[shape] = frame
+
+        for other in {c[1] for c in self._conditional_rows}:
+            if other in self.extra_vars:
+                self.extra_vars[other].trace_add(
+                    "write", lambda *_: self._refresh_conditional_fields())
+        self._refresh_conditional_fields()
 
         self.none_frame = ttk.Label(self.plugin_settings_frame,
                                     text="No extra settings for this plugin.", foreground="#777")
+
+    def _build_choice_combobox(self, parent, var, opts):
+        """Readonly dropdown for a "choice" field; with opts["labels"] it shows
+        the friendly text while var keeps the short value the plugin expects."""
+        labels = opts.get("labels")
+        if not labels:
+            return ttk.Combobox(parent, textvariable=var, state="readonly", width=7,
+                                values=opts["choices"])
+        inverse = {v: k for k, v in labels.items()}
+        display = tk.StringVar(value=labels.get(var.get(), var.get()))
+        combo = ttk.Combobox(parent, textvariable=display, state="readonly", width=15,
+                             values=[labels[c] for c in opts["choices"]])
+        combo.bind("<<ComboboxSelected>>", lambda e: var.set(inverse[display.get()]))
+        var.trace_add("write", lambda *_: display.set(labels.get(var.get(), var.get())))
+        return combo
+
+    def _extra_field_shown(self, name):
+        """False for a "show_if" field whose condition is currently not met."""
+        spec = EXTRA_ARG_SPECS.get(name, ())
+        cond = spec[3].get("show_if") if len(spec) > 3 else None
+        if not cond or cond[0] not in self.extra_vars:
+            return True
+        return str(self.extra_vars[cond[0]].get()) == str(cond[1])
+
+    def _refresh_conditional_fields(self):
+        for widgets, other, value in self._conditional_rows:
+            shown = other in self.extra_vars and str(self.extra_vars[other].get()) == str(value)
+            for w in widgets:
+                if shown:
+                    w.grid()
+                else:
+                    w.grid_remove()
 
     def _show_plugin_settings(self, plugin_id):
         for w in list(self._extra_frames.values()) + [self.none_frame]:
@@ -683,11 +789,19 @@ class FlimMasterApp(tk.Tk):
     def _build_fit_method_settings(self, parent):
         f = ttk.LabelFrame(parent, text="Fit method")
         f.pack(fill="x", pady=(0, 8))
+        self.fit_method_frame = f
 
-        ttk.Label(f, text="Fit method:").grid(row=0, column=0, sticky="w", padx=4, pady=(4, 3))
+        self.fit_method_label = ttk.Label(f, text="Fit method:")
+        self.fit_method_label.grid(row=0, column=0, sticky="w", padx=4, pady=(4, 3))
         self.fit_method_var = tk.StringVar(value="tail")
-        self._build_mapped_combobox(f, self.fit_method_var, FIT_METHOD_LABELS,
-                                    self._on_fit_method_changed).grid(row=0, column=1, padx=4, pady=(4, 3))
+        # Like _build_mapped_combobox, but the offered methods/labels change
+        # with the selected plugin (GUI_OPTIONS["fit_methods"]).
+        self._fit_method_labels = dict(FIT_METHOD_LABELS)
+        self._fit_method_display = tk.StringVar(value=FIT_METHOD_LABELS["tail"])
+        self.fit_method_combo = ttk.Combobox(f, textvariable=self._fit_method_display, state="readonly",
+                                             values=list(FIT_METHOD_LABELS.values()), width=20)
+        self.fit_method_combo.bind("<<ComboboxSelected>>", self._on_fit_method_combo)
+        self.fit_method_combo.grid(row=0, column=1, padx=4, pady=(4, 3))
 
         self.tail_settings_frame = ttk.Frame(f)
         ttk.Label(self.tail_settings_frame, text="Tail start offset (bins):").grid(
@@ -798,6 +912,7 @@ class FlimMasterApp(tk.Tk):
         # ── Lifetime display range ────────────────────────────────────────────────
         f_lr = ttk.LabelFrame(parent, text="Lifetime display range")
         f_lr.pack(fill="x", pady=(0, 8))
+        self.lifetime_range_frame = f_lr
 
         self.lifetime_range_auto_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -886,9 +1001,58 @@ class FlimMasterApp(tk.Tk):
         self.tail_settings_frame.grid_forget()
         self.irf_settings_frame.grid_forget()
         if self.fit_method_var.get() in ("irf", "mean_irf"):
-            self.irf_settings_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+            if self._current_gui_options()["tail_offset_with_irf"]:
+                self.tail_settings_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+            self.irf_settings_frame.grid(row=3, column=0, columnspan=2, sticky="ew")
         else:
             self.tail_settings_frame.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+    def _on_fit_method_combo(self, event=None):
+        inverse = {v: k for k, v in self._fit_method_labels.items()}
+        self.fit_method_var.set(inverse[self._fit_method_display.get()])
+        self._on_fit_method_changed()
+
+    def _current_gui_options(self):
+        plugin = self.plugins_by_id.get(getattr(self, "plugin_id", None))
+        return plugin["gui"] if plugin else registry.GUI_OPTION_DEFAULTS
+
+    def _apply_plugin_gui(self):
+        """Show only the settings the selected plugin uses (its GUI_OPTIONS):
+        fit-method choices and section title, Model, Lifetime display range,
+        and output toggles. Driven purely by declared metadata."""
+        opts = self._current_gui_options()
+
+        # fit-method dropdown
+        labels = opts["fit_methods"] or FIT_METHOD_LABELS
+        self._fit_method_labels = dict(labels)
+        self.fit_method_combo.config(values=list(labels.values()))
+        if self.fit_method_var.get() not in labels:
+            self.fit_method_var.set(next(iter(labels)))
+        self._fit_method_display.set(labels[self.fit_method_var.get()])
+        title = opts["fit_method_title"]
+        self.fit_method_frame.config(text=title)
+        self.fit_method_label.config(text=f"{title}:")
+        self._show_fit_method_settings()
+        self._update_fix_tau_short_state()
+
+        # right-column sections
+        hidden = set()
+        if not opts["uses_model"]:
+            hidden.add(self.model_frame)
+        if not opts["uses_lifetime_range"]:
+            hidden.add(self.lifetime_range_frame)
+        for w, _ in self._right_sections:
+            w.pack_forget()
+        for w, info in self._right_sections:
+            if w not in hidden:
+                w.pack(**info)
+
+        # output toggles
+        for b in self._output_toggles.values():
+            b.pack_forget()
+        for name, b in self._output_toggles.items():
+            if name in opts["outputs"]:
+                b.pack(anchor="w", padx=8, pady=2)
 
     def _select_irf_file(self):
         path = filedialog.askopenfilename(
@@ -915,6 +1079,7 @@ class FlimMasterApp(tk.Tk):
     def _build_model_settings(self, parent):
         f = ttk.LabelFrame(parent, text="Model")
         f.pack(fill="x", pady=(0, 8))
+        self.model_frame = f
 
         ttk.Label(f, text="Model:").grid(row=0, column=0, sticky="w", padx=4, pady=3)
         self.model_var = tk.StringVar(value="Biexponential")
@@ -1096,6 +1261,8 @@ class FlimMasterApp(tk.Tk):
         self._set_plugin_availability()
         self.plugin_var.set("")
         self.plugin_id = None
+        self._show_plugin_settings(None)
+        self._apply_plugin_gui()
         self.run_button.state(["disabled"])
         self.apply_button.state(["!disabled"])
         self._log_clear()
@@ -1170,6 +1337,7 @@ class FlimMasterApp(tk.Tk):
     def _on_plugin_selected(self):
         self.plugin_id = self.plugin_var.get()
         self._show_plugin_settings(self.plugin_id)
+        self._apply_plugin_gui()
         self.run_button.state(["!disabled"] if self.filepath else ["disabled"])
         self.mask_panel.clear("Click Apply to preview the mask")
         self.last_preview_mask = None
@@ -1477,7 +1645,9 @@ class FlimMasterApp(tk.Tk):
             masking = "_extmask"
 
         fit_method = settings["fit_method"]
-        if fit_method == "mean":
+        if not self.plugins_by_id[plugin_id]["gui"]["uses_model"]:
+            fit = f"_{fit_method}"       # e.g. phasor: "_tail" / "_irf"
+        elif fit_method == "mean":
             fit = "_mean"
         elif fit_method == "mean_irf":
             fit = "_mean_irf"
@@ -1497,6 +1667,8 @@ class FlimMasterApp(tk.Tk):
         ("rolling_window", lambda v: f"_rw{int(v)}" if int(v) > 1 else ""),
         ("period",         lambda v: f"_per{float(v):g}s"),
         ("groups",         lambda v: f"_g{int(v)}"),
+        ("harmonic",       lambda v: f"_h{int(v)}" if int(v) > 1 else ""),
+        ("decay_model",    lambda v: "_single" if str(v) == "single" else ""),
     )
 
     def _extra_args_postfix(self, plugin_id, settings):
@@ -1676,8 +1848,10 @@ class FlimMasterApp(tk.Tk):
         # ignores both when either fit method is selected). Keep the metadata
         # file honest about what actually ran instead of always recording the
         # biexponential settings regardless of fit method.
+        gui = plugin["gui"]
         is_mean = settings["fit_method"] in ("mean", "mean_irf")
-        if not is_mean:
+        uses_model = gui["uses_model"] and not is_mean
+        if uses_model:
             lines.append(f"  model: {'mono' if settings['mono'] else 'bi'}")
             lines.append(f"  lifetime_preset: {settings['lifetime_preset']}")
             def _bounds(key, default):
@@ -1690,6 +1864,8 @@ class FlimMasterApp(tk.Tk):
                 lines.append(f"  tau_long_bounds: {_bounds('tau_long_bounds', TAU_LONG_BOUNDS)}")
         lines.append(f"  fit_method: {settings['fit_method']}")
         if settings["fit_method"] in ("irf", "mean_irf"):
+            if gui["tail_offset_with_irf"]:
+                lines.append(f"  tail_start_offset: {settings['tail_start_offset']}")
             lines.append(f"  irf_file: {settings['irf_path']}")
             lines.append(f"  no_shift: {settings['no_shift']}")
             lines.append(f"  irf_full: {settings['irf_full']}")
@@ -1703,16 +1879,16 @@ class FlimMasterApp(tk.Tk):
             lines.append(f"  tail_start_offset: {settings['tail_start_offset']}")
 
         for name in plugin["extra_args"]:
-            lines.append(f"  {name}: {settings['extra'].get(name)}")
+            if self._extra_field_shown(name):
+                lines.append(f"  {name}: {settings['extra'].get(name)}")
 
-        vlim = settings["lifetime_vlim"]
-        lines.append(f"  lifetime_plot_range_ns: {vlim if vlim is not None else 'auto'}")
-        lines.append(f"  save_overview: {settings['save_overview']}")
-        lines.append(f"  save_results: {settings['save_results']}")
-        lines.append(f"  save_quality_plots: {settings['save_quality_plots']}")
-        lines.append(f"  save_irf_check: {settings['save_irf_check']}")
+        if gui["uses_lifetime_range"]:
+            vlim = settings["lifetime_vlim"]
+            lines.append(f"  lifetime_plot_range_ns: {vlim if vlim is not None else 'auto'}")
+        for name in gui["outputs"]:
+            lines.append(f"  {name}: {settings[name]}")
 
-        if not is_mean and not settings["mono"]:
+        if uses_model and not settings["mono"]:
             lines.append(f"  fix_tau_short: {settings['fix_tau_short']}")
             if settings["fix_tau_short"]:
                 value = settings["tau_short_value"]

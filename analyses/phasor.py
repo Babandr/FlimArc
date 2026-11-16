@@ -14,9 +14,9 @@ its arc; changes in the amplitude ratio move the pixel's point along the
 connecting tie-line.  These two effects are geometrically separable in (G, S),
 which is NOT possible from mean arrival time alone.
 
-Time window modes
------------------
-  "tail" (default): Fourier-transform only the tail bins — the same window
+Time window (chosen by fit_method)
+----------------------------------
+  fit_method "tail" (default): Fourier-transform only the tail bins — the same window
       as the existing tail-fit plugins, beginning a few bins after the
       decay peak.  Excludes the IRF-dominated rise region.  No IRF file
       needed.  The resulting phasor points do NOT lie exactly on the
@@ -24,10 +24,12 @@ Time window modes
       move monotonically and reproducibly with lifetime changes, making
       this mode ideal for relative measurements such as timelapse tracking.
 
-  "full": use the entire TCSPC window including the peak region.  Gives
-      phasor points closer to the universal semicircle.  Recommended when
-      an IRF measurement is available (--irf) for phasor-space correction,
-      though it is still useful without one for relative comparisons.
+  fit_method "irf": use the entire TCSPC window including the peak region
+      and divide out the IRF phasor (--irf required).  Points of a
+      monoexponential decay land on the universal semicircle, so
+      tau_phase / tau_mod are real lifetimes.  An uncorrected full window
+      is not offered: its points are rotated by the IRF and the timing
+      offset, which mimics a lifetime change.
 
 IRF correction (--irf, optional)
 ---------------------------------
@@ -40,7 +42,7 @@ finite IRF width.  The IRF file and the data generally have a timing offset
 (separate acquisitions, cabling); it is measured with one reconvolution fit
 of the pooled masked decay -- the same fit the reconvolution plugins use --
 and applied as the exp(...) rotation. With --no-shift the offset is held at
-zero.  Only valid with --window-mode full (skipped for 'tail'); it restores
+zero.  Only valid with the full window (fit_method "irf"); it restores
 points to the universal semicircle for a monoexponential decay.
 
 For tracking RELATIVE lifetime changes in a timelapse on the same
@@ -66,6 +68,34 @@ monoexponential decay (starting at the decay peak, repeating every laser
 period) using the same time window as the data, so they are consistent with
 the measured phasor points regardless of which bins are included.
 
+Single-lifetime mode (--decay-model single)
+-------------------------------------------
+For a sample with ONE lifetime (that may change across the image or over
+time) every pixel's phasor should lie on the single-lifetime curve: the
+phasors of pure monoexponential decays of every lifetime, computed
+numerically through the same window as the data (the universal semicircle
+in IRF-corrected mode; a different, known curve for a tail window). Each
+pixel is projected onto the nearest point of that curve:
+  tau_single -- lifetime of that point (ns). A real lifetime in BOTH window
+                modes, unlike tau_phase/tau_mod in tail mode. Uses G and S
+                together, so it is less noisy than the phase alone.
+  off_curve  -- signed distance from the curve (phasor units). ~0 within
+                noise for a truly single-exponential pixel; positive = on
+                the inner side, where mixtures of lifetimes (including a
+                zero-lifetime scatter/reflection) fall; negative = outer
+                side (e.g. under-subtracted background in tail mode, or a
+                timing/IRF error). Check it before trusting tau_single.
+Background in this mode is ONE image-wide level per bin: the constant of a
+biexponential + constant fit of the pooled masked tail, divided by the
+number of pixels. It ASSUMES the background is the same in every pixel
+(logged). Why not per pixel: the lifetime varies from pixel to pixel, so
+one fixed decay shape biases B -- and with it tau -- wherever the lifetime
+differs from the pooled value; from tail bins a per-pixel B cannot be
+separated from a per-pixel lifetime; and iterating B with each pixel's own
+tau_single runs away (B grows, points leave the curve) as soon as a pixel
+is not truly single-exponential (tested on Flipper-TR data).
+An optional reference lifetime (--tau-ref) is marked on the plot.
+
 Laser period (--rep-rate-mhz)
 -----------------------------
 The phasor frequency is the laser repetition rate. If it is not given, the
@@ -86,7 +116,7 @@ within the laser period (e.g. a 4.3 ns component at 80 MHz) most of those
 counts are real decay, and how much varies from pixel to pixel. Instead,
 each pixel's tail bins are described as a1*p1 + a2*p2 + B with p1, p2 the
 periodic decay shapes of two fixed lifetimes (tau_ref1/tau_ref2 if given,
-else a pooled biexponential fit). With the lifetimes fixed this is linear,
+else a pooled biexponential fit). Single-lifetime mode differs, see above. With the lifetimes fixed this is linear,
 so all pixels are solved in one least-squares step -- no optimizer, and B
 is unbiased. The decay amplitudes are discarded; the phasor itself stays
 model-free.
@@ -95,6 +125,7 @@ Outputs (per input file)
 -------------------------
   <prefix>_phasor_scatter.png   -- 2D density phasor plot
   <prefix>_phasor_maps.png      -- spatial maps of tau_phase, tau_mod, f_long
+                                   (single-lifetime mode: tau_single, off_curve)
   <prefix>_phasor.npz           -- all maps (G, S, tau_phase, tau_mod, ...)
 """
 
@@ -128,10 +159,23 @@ DESCRIPTION = (
 )
 REQUIRES_RAW = False   # works on raw, exported, and .ds3d alike
 IRF_CAPABLE = True     # optional IRF file for phasor-space correction
-# Rendered by the GUI as plain text entries (values arrive as str, possibly
-# empty) -- parsed by _extra_args() below. Empty = default.
-EXTRA_ARGS = ["harmonic", "window_mode", "tau_ref1", "tau_ref2", "rep_rate_mhz",
-              "subtract_background"]
+# The GUI may pass these as str ("" = default), int or bool -- parsed by
+# _extra_args() below. The time window is not an extra arg: it follows the
+# common fit_method ("tail" -> tail window, "irf" -> full window + IRF).
+EXTRA_ARGS = ["harmonic", "rep_rate_mhz", "subtract_background", "decay_model",
+              "tau_ref", "tau_ref1", "tau_ref2"]
+
+# Which common GUI settings apply (see analyses/_registry.py): no lifetime
+# model, bounds or display range; the tail offset is also used in IRF mode
+# (background estimate); only overview and results plots are produced.
+GUI_OPTIONS = dict(
+    fit_methods={"tail": "Tail window", "irf": "Full decay + IRF correction"},
+    fit_method_title="Decay window",
+    tail_offset_with_irf=True,
+    uses_model=False,
+    uses_lifetime_range=False,
+    outputs=("save_overview", "save_results"),
+)
 
 
 def _extra_args(args):
@@ -149,11 +193,33 @@ def _extra_args(args):
     harmonic = _num("harmonic", int, 1)
     if harmonic < 1:
         raise ValueError(f"harmonic must be >= 1, got {harmonic}")
-    window_mode = (getattr(args, "window_mode", None) or "tail").strip().lower()
-    if window_mode not in ("tail", "full"):
-        raise ValueError(f"window_mode must be 'tail' or 'full', got {window_mode!r}")
-    tau_ref1 = _num("tau_ref1", float, None)
-    tau_ref2 = _num("tau_ref2", float, None)
+    if getattr(args, "window_mode", None):
+        raise ValueError("window_mode was replaced by fit_method: use fit_method='tail' "
+                         "for the tail window or fit_method='irf' (with an IRF file) "
+                         "for the full window with IRF correction.")
+    fit_method = getattr(args, "fit_method", None) or "tail"
+    if fit_method == "tail":
+        window_mode = "tail"
+    elif fit_method == "irf":
+        if not getattr(args, "irf", None):
+            raise ValueError("fit_method='irf' needs an IRF file (the full-window phasor "
+                             "is only meaningful after IRF correction).")
+        window_mode = "full"
+    else:
+        raise ValueError(f"Phasor supports fit_method 'tail' or 'irf', got {fit_method!r}.")
+    dm = getattr(args, "decay_model", None)
+    dm = "bi" if dm is None or not str(dm).strip() else str(dm).strip().lower()
+    if dm in ("single", "mono", "1", "single lifetime"):
+        decay_model = "single"
+    elif dm in ("bi", "two", "2", "two lifetimes"):
+        decay_model = "bi"
+    else:
+        raise ValueError(f"decay_model = {dm!r}: use 'single' or 'bi'")
+    tau_ref = _num("tau_ref", float, None) if decay_model == "single" else None
+    if tau_ref is not None and tau_ref <= 0:
+        raise ValueError(f"tau_ref must be > 0, got {tau_ref}")
+    tau_ref1 = _num("tau_ref1", float, None) if decay_model == "bi" else None
+    tau_ref2 = _num("tau_ref2", float, None) if decay_model == "bi" else None
     if (tau_ref1 is None) != (tau_ref2 is None):
         print("  NOTE: only one of tau_ref1/tau_ref2 given -- both are needed for "
               "the tie-line and f_long; skipping them.")
@@ -173,7 +239,9 @@ def _extra_args(args):
             raise ValueError(f"subtract_background = {sb!r}: use yes/no")
     else:
         subtract_bg = bool(sb)
-    return harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz, subtract_bg
+    return dict(harmonic=harmonic, window_mode=window_mode, decay_model=decay_model,
+                tau_ref=tau_ref, tau_ref1=tau_ref1, tau_ref2=tau_ref2,
+                rep_rate_mhz=rep_rate_mhz, subtract_bg=subtract_bg)
 
 
 def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
@@ -233,13 +301,41 @@ def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
     Y = cube[mask][:, s_idx:].astype(np.float64).T       # (n_tail, n_pixels)
     coef, *_ = np.linalg.lstsq(X, Y, rcond=None)
     B = np.zeros(cube.shape[:2])
-    B[mask] = coef[2]
+    B[mask] = coef[-1]
 
     n_tot = cube[mask].sum(axis=1)
-    frac = coef[2] * nb / np.where(n_tot > 0, n_tot, np.nan)
+    frac = coef[-1] * nb / np.where(n_tot > 0, n_tot, np.nan)
     print(f"  Background: per-pixel fit in the tail (decay shapes {taus[0]:.2f} / "
-          f"{taus[1]:.2f} ns from {src}): median {np.median(coef[2]):.2f} counts/bin "
+          f"{taus[1]:.2f} ns from {src}): median {np.median(coef[-1]):.2f} counts/bin "
           f"= {100 * np.nanmedian(frac):.1f}% of all photons")
+    return B, info
+
+
+def uniform_background(cube, mask, s, tail_offset):
+    """One image-wide background level (counts per bin per pixel): the
+    constant of a biexponential + constant fit of the pooled masked tail,
+    divided by the number of masked pixels. Pooling makes it precise, and
+    the two exponentials absorb a spread of lifetimes, so it is not biased
+    by lifetime differences between pixels -- but it assumes the background
+    is the same in every pixel. Returns (B map or None, info dict)."""
+    pooled = cube[mask].sum(axis=0).astype(float)
+    _, _pk, s_idx, tn = _tail_axis(s, pooled[None, None, :], offset=tail_offset)
+    info = dict(taus=None, n_tail_bins=cube.shape[2] - s_idx)
+    try:
+        g = global_fit(pooled, s, s_idx, tn, mono=False, fit_background=True)
+    except Exception as exc:
+        print(f"  WARNING: pooled fit for the background failed ({exc}); "
+              f"background subtraction skipped.")
+        return None, info
+    info["taus"] = (float(g["tau_short"]), float(g["tau_long"]))
+    level = float(g["popt"][-1]) / int(mask.sum())
+    B = np.zeros(cube.shape[:2])
+    B[mask] = level
+    n_tot = cube[mask].sum(axis=1)
+    print(f"  Background: one image-wide level from a pooled biexponential + constant "
+          f"fit: {level:.2f} counts/bin per pixel = "
+          f"{100 * np.median(level * cube.shape[2] / np.maximum(n_tot, 1)):.1f}% of all photons "
+          f"(median pixel)")
     return B, info
 
 
@@ -314,6 +410,84 @@ def _reference_phasor(tau_ns, t_abs_win, t0_ns, T_laser_ns, harmonic=1):
     G_ref = float(np.sum(h_ref * np.cos(omega * t_abs_win)))
     S_ref = float(np.sum(h_ref * np.sin(omega * t_abs_win)))
     return G_ref, S_ref, w_window
+
+
+def single_lifetime_curve(t_abs_win, t0_ns, T_laser_ns, harmonic=1,
+                          tau_min_ns=0.01, n=4000):
+    """The single-lifetime curve for this window: phasors of pure periodic
+    monoexponential decays (same construction as _reference_phasor) for a
+    log-spaced grid of lifetimes. Returns (tau, G, S), tau increasing.
+
+    In IRF-corrected full-window mode this is the universal semicircle (up
+    to bin sampling); for a tail window it is a different curve, which is why
+    it is computed numerically rather than from 1/(1 + i w tau)."""
+    tau = np.geomspace(tau_min_ns, 5.0 * T_laser_ns, n)
+    omega = 2.0 * np.pi * harmonic / T_laser_ns
+    u = np.mod(t_abs_win - t0_ns, T_laser_ns)                       # (n_win,)
+    with np.errstate(over="ignore", under="ignore"):
+        p = np.exp(-u[None, :] / tau[:, None])                       # (n, n_win)
+    tot = p.sum(axis=1)
+    ok = np.isfinite(tot) & (tot > 0)
+    tau, p, tot = tau[ok], p[ok], tot[ok]
+    G = (p * np.cos(omega * t_abs_win)).sum(axis=1) / tot
+    S = (p * np.sin(omega * t_abs_win)).sum(axis=1) / tot
+    return tau, G, S
+
+
+def project_on_curve(G, S, mask, curve_tau, curve_G, curve_S, chunk=4096):
+    """Project every masked pixel phasor onto the single-lifetime curve.
+
+    Nearest grid point first, then the exact foot of the perpendicular on
+    the neighbouring segments (lifetime interpolated in log tau), so the
+    result does not depend on the grid spacing.
+
+    Returns (tau_single, off_curve), both [H, W] float32, NaN outside the
+    mask and where the nearest point is an END of the curve grid (the
+    pixel lies beyond the range of physical lifetimes).
+    off_curve is signed: positive = left of the curve walking towards
+    longer lifetimes, i.e. the inner side (for the semicircle: inside it,
+    where mixtures of lifetimes fall)."""
+    H, W = G.shape
+    tau_out = np.full((H, W), np.nan, dtype=np.float32)
+    d_out = np.full((H, W), np.nan, dtype=np.float32)
+    sel = mask & np.isfinite(G) & np.isfinite(S)
+    if not sel.any():
+        return tau_out, d_out
+    P = np.column_stack([G[sel], S[sel]])
+    C = np.column_stack([curve_G, curve_S])
+    logtau = np.log(curve_tau)
+    n = len(C)
+    tau_px = np.empty(len(P))
+    d_px = np.empty(len(P))
+    for i0 in range(0, len(P), chunk):
+        p = P[i0:i0 + chunk]
+        d2 = ((p[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
+        k = np.argmin(d2, axis=1)
+        best_d = np.full(len(p), np.inf)
+        best_tau = np.full(len(p), np.nan)
+        best_sign = np.zeros(len(p))
+        for a_off in (-1, 0):                       # segments [k-1, k] and [k, k+1]
+            a = np.clip(k + a_off, 0, n - 2)
+            b = a + 1
+            v = C[b] - C[a]
+            w = p - C[a]
+            vv = np.maximum((v ** 2).sum(axis=1), 1e-30)
+            tt = np.clip((w * v).sum(axis=1) / vv, 0.0, 1.0)
+            q = C[a] + tt[:, None] * v
+            r = p - q
+            dist = np.sqrt((r ** 2).sum(axis=1))
+            better = dist < best_d
+            best_d[better] = dist[better]
+            best_tau[better] = np.exp(logtau[a] + tt * (logtau[b] - logtau[a]))[better]
+            cross = v[:, 0] * r[:, 1] - v[:, 1] * r[:, 0]
+            best_sign[better] = np.sign(cross)[better]
+        at_end = (k == 0) | (k == n - 1)
+        best_tau[at_end] = np.nan
+        tau_px[i0:i0 + chunk] = best_tau
+        d_px[i0:i0 + chunk] = np.where(at_end, np.nan, best_sign * best_d)
+    tau_out[sel] = tau_px
+    d_out[sel] = d_px
+    return tau_out, d_out
 
 
 def _window_to_total_fraction(f_win, w_short, w_long):
@@ -516,7 +690,7 @@ def fraction_long(G, S, G1, S1, G2, S2):
 
 def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
                         G1_ref=None, S1_ref=None, G2_ref=None, S2_ref=None,
-                        show=True):
+                        show=True, curve=None, tau_ref=None, G_ref=None, S_ref=None):
     """2-D density phasor scatter plot with universal semicircle overlay."""
     G_px = result["G"][mask & np.isfinite(result["G"])]
     S_px = result["S"][mask & np.isfinite(result["S"])]
@@ -533,12 +707,24 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
 
     # Lifetime ticks on semicircle (reference orientation only)
     tick_taus = [0.5, 1.0, 1.41, 2.0, 3.0, 4.30, 6.0, 10.0]
-    for tau in tick_taus:
-        Gt = 1.0 / (1 + (omega * tau)**2)
-        St = omega * tau / (1 + (omega * tau)**2)
-        ax.plot(Gt, St, "o", ms=2.5, color="#bbbbbb", zorder=2)
-        ax.annotate(f"{tau}", (Gt, St), textcoords="offset points",
-                    xytext=(2, 2), fontsize=5.5, color="#999999")
+    if curve is None:
+        for tau in tick_taus:
+            Gt = 1.0 / (1 + (omega * tau)**2)
+            St = omega * tau / (1 + (omega * tau)**2)
+            ax.plot(Gt, St, "o", ms=2.5, color="#bbbbbb", zorder=2)
+            ax.annotate(f"{tau}", (Gt, St), textcoords="offset points",
+                        xytext=(2, 2), fontsize=5.5, color="#999999")
+    else:
+        # Single-lifetime curve for THIS window, with lifetime ticks on it
+        c_tau, c_G, c_S = curve
+        ax.plot(c_G, c_S, color="#7B1FA2", lw=1.3, zorder=2,
+                label="single-lifetime curve (this window)")
+        for tau in [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]:
+            Gt, St = np.interp(np.log(tau), np.log(c_tau), c_G), \
+                     np.interp(np.log(tau), np.log(c_tau), c_S)
+            ax.plot(Gt, St, "o", ms=2.5, color="#7B1FA2", zorder=2)
+            ax.annotate(f"{tau:g}", (Gt, St), textcoords="offset points",
+                        xytext=(3, 2), fontsize=6, color="#7B1FA2")
 
     # Plot limits: always show the semicircle, but extend to include the data
     # and reference points -- tail-window phasors lie OFF the semicircle
@@ -551,6 +737,9 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
     if G1_ref is not None:
         g_pts += [G1_ref - 0.05, G2_ref - 0.05, G1_ref + 0.05, G2_ref + 0.05]
         s_pts += [S1_ref - 0.05, S2_ref - 0.05, S1_ref + 0.05, S2_ref + 0.05]
+    if G_ref is not None:
+        g_pts += [G_ref - 0.05, G_ref + 0.05]
+        s_pts += [S_ref - 0.05, S_ref + 0.05]
     xlim = (min(g_pts), max(g_pts))
     ylim = (min(s_pts), max(s_pts))
 
@@ -577,6 +766,10 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
         ax.plot(G2_ref, S2_ref, "s", color="#E05C3A", ms=9, zorder=5,
                 label=f"τ_long  = {tau_ref2} ns")
 
+    if G_ref is not None:
+        ax.plot(G_ref, S_ref, "D", color="#E05C3A", ms=8, zorder=5,
+                label=f"τ_ref = {tau_ref} ns")
+
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
     ax.set_xlabel("G  (cosine component)", fontsize=11)
@@ -597,8 +790,9 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
 
 
 def plot_phasor_maps(result, mask, prefix, f_long=None, tau_ref1=None,
-                     tau_ref2=None, show=True):
-    """Spatial maps of tau_phase, tau_mod, and optionally f_long."""
+                     tau_ref2=None, show=True, tau_single=None, off_curve=None):
+    """Spatial maps of tau_phase, tau_mod, and optionally f_long -- or, in
+    single-lifetime mode, tau_single and off_curve."""
     n_panels = 3 if f_long is not None else 2
     fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4.5),
                              squeeze=False)
@@ -618,8 +812,16 @@ def plot_phasor_maps(result, mask, prefix, f_long=None, tau_ref1=None,
         cb = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.03)
         cb.set_label(unit, fontsize=9)
 
-    _show(axes[0], result["tau_phase"], "τ_phase  (ns)", cmap="plasma")
-    _show(axes[1], result["tau_mod"],   "τ_mod  (ns)",   cmap="plasma")
+    if tau_single is not None:
+        _show(axes[0], tau_single, "τ_single  (ns)", cmap="plasma")
+        oc = off_curve[mask & np.isfinite(off_curve)]
+        lim = float(np.percentile(np.abs(oc), 98)) if oc.size else 0.05
+        lim = max(lim, 1e-3)
+        _show(axes[1], off_curve, "distance from single-lifetime curve\n(+ = inner side)",
+              cmap="RdBu_r", vmin=-lim, vmax=lim, unit="phasor units")
+    else:
+        _show(axes[0], result["tau_phase"], "τ_phase  (ns)", cmap="plasma")
+        _show(axes[1], result["tau_mod"],   "τ_mod  (ns)",   cmap="plasma")
     if f_long is not None:
         lbl = (f"f_long  (τ={tau_ref2} ns)"
                if tau_ref2 is not None else "f_long")
@@ -643,7 +845,10 @@ def plot_phasor_maps(result, mask, prefix, f_long=None, tau_ref1=None,
 
 def process_file(h5file, args):
     """Load → mask → phasor → plot → save pipeline for one file."""
-    harmonic, window_mode, tau_ref1, tau_ref2, rep_rate_mhz, subtract_bg = _extra_args(args)
+    ea = _extra_args(args)
+    harmonic, window_mode, decay_model = ea["harmonic"], ea["window_mode"], ea["decay_model"]
+    tau_ref, tau_ref1, tau_ref2 = ea["tau_ref"], ea["tau_ref1"], ea["tau_ref2"]
+    rep_rate_mhz, subtract_bg = ea["rep_rate_mhz"], ea["subtract_bg"]
     show = not getattr(args, "no_show", True)
 
     stem   = Path(h5file).stem
@@ -778,25 +983,27 @@ def process_file(h5file, args):
     # ---- background ----
     bg_map, bg_info = None, None
     if subtract_bg:
-        bg_map, bg_info = estimate_background(
-            cube, mask, s, tail_offset, T_laser_ns,
-            taus=(tau_ref1, tau_ref2) if tau_ref1 is not None else None)
+        if decay_model == "single":
+            bg_map, bg_info = uniform_background(cube, mask, s, tail_offset)
+            if bg_map is not None:
+                print("    NOTE: single-lifetime mode takes the background as the same in "
+                      "every pixel (a per-pixel level cannot be separated reliably from a "
+                      "lifetime that varies per pixel).")
+        else:
+            bg_map, bg_info = estimate_background(
+                cube, mask, s, tail_offset, T_laser_ns,
+                taus=(tau_ref1, tau_ref2) if tau_ref1 is not None else None)
     else:
         print("  Background subtraction off.")
 
-    # ---- compute phasor ----
-    print(f"  Phasor: harmonic={harmonic}, window='{window_mode}' [{win_label}], "
-          f"T={T_laser_ns:.2f} ns ...")
-    result = compute_phasor(cube_win, t_abs_win, T_laser_ns, mask, harmonic=harmonic,
-                            bg_per_bin=bg_map)
-    result["irf_corrected"] = False
-
-    # ---- optional IRF correction ----
+    # ---- optional IRF correction: timing offset measured once ----
+    irf_grid = irf_shift = None
     if irf is not None and window_mode == "tail":
         # Dividing by the IRF phasor is only valid when the data phasor is the
         # transform of the FULL convolved decay (IRF * decay). A tail-only
         # phasor is not, so the division would give a wrong (G, S).
-        print("  NOTE: IRF correction skipped -- it is only valid with window_mode='full'.")
+        print("  NOTE: IRF file ignored -- IRF correction needs the full window "
+              "(fit_method='irf').")
     elif irf is not None:
         no_shift = getattr(args, "no_shift", False)
         irf_grid = _irf_on_data_grid(irf["irf_norm"], nb)
@@ -813,27 +1020,53 @@ def process_file(h5file, args):
             if nb * tpb_ns < 0.99 * T_laser_ns:
                 print("  WARNING: the histogram window is shorter than the laser period, "
                       "so the data are not one full period -- IRF correction is approximate.")
-            print("  Applying IRF correction in phasor space ...")
-            apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic)
-            result["irf_shift_bins"] = irf_shift
-    elif window_mode == "full":
-        print("  NOTE: 'full' window without --irf -- G/S include IRF phase "
-              "contribution.  Results are valid for relative comparisons.")
+
+    # ---- compute phasor ----
+    print(f"  Phasor: harmonic={harmonic}, window='{window_mode}' [{win_label}], "
+          f"T={T_laser_ns:.2f} ns, decay model '{decay_model}' ...")
+    result = compute_phasor(cube_win, t_abs_win, T_laser_ns, mask, harmonic=harmonic,
+                            bg_per_bin=bg_map)
+    result["irf_corrected"] = False
+    if irf_shift is not None:
+        print("  Applying IRF correction in phasor space ...")
+        apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic)
+        result["irf_shift_bins"] = irf_shift
 
     # ---- reference phasor points and f_long ----
     G1_ref = S1_ref = G2_ref = S2_ref = None
     f_long_map = f_long_win_map = None
-    w1 = w2 = t0_ns = None
+    w1 = w2 = None
+    G_ref = S_ref = None
+    curve = tau_single_map = off_curve_map = None
+
+    # Excitation time on the data's time axis. After IRF correction the
+    # decay is referenced to the IRF's own time origin, as sampled at bin
+    # centres (see irf_timing_shift) -- hence -half a bin on this
+    # left-edge time axis. Without it, the decay peak is used -- a slight
+    # approximation, because the true excitation is a little earlier than
+    # the peak (by roughly the IRF rise), which slightly biases the
+    # tail-window weights.
+    t0_ns = -0.5 * tpb_ns if result["irf_corrected"] else (peak_bin - s["B0"]) * tpb_ns
+
+    if decay_model == "single":
+        curve = single_lifetime_curve(t_abs_win, t0_ns, T_laser_ns, harmonic)
+        print(f"  Projecting pixels onto the single-lifetime curve (this window, "
+              f"decay start t0={t0_ns:.2f} ns) ...")
+        tau_single_map, off_curve_map = project_on_curve(
+            result["G"], result["S"], mask, *curve)
+        n_end = int((mask & np.isfinite(result["G"]) & ~np.isfinite(tau_single_map)).sum())
+        if n_end:
+            print(f"    {n_end} pixel(s) lie beyond the ends of the curve -> NaN")
+        if tau_ref is not None:
+            G_ref, S_ref, _w = _reference_phasor(tau_ref, t_abs_win, t0_ns, T_laser_ns, harmonic)
+            print(f"    tau_ref={tau_ref} ns -> G={G_ref:.4f}, S={S_ref:.4f}")
+        for lbl, arr in (("tau_single", tau_single_map), ("off_curve", off_curve_map)):
+            v = arr[np.isfinite(arr)]
+            if v.size:
+                print(f"    {lbl}: median={np.median(v):.4f}, std={np.std(v):.4f}, "
+                      f"[{np.percentile(v, 2):.4f} to {np.percentile(v, 98):.4f}]")
 
     if tau_ref1 is not None and tau_ref2 is not None:
-        # Excitation time on the data's time axis. After IRF correction the
-        # decay is referenced to the IRF's own time origin, as sampled at bin
-        # centres (see irf_timing_shift) -- hence -half a bin on this
-        # left-edge time axis. Without it, the decay peak is used -- a slight
-        # approximation, because the true excitation is a little earlier than
-        # the peak (by roughly the IRF rise), which slightly biases the
-        # tail-window weights.
-        t0_ns = -0.5 * tpb_ns if result["irf_corrected"] else (peak_bin - s["B0"]) * tpb_ns
         G1_ref, S1_ref, w1 = _reference_phasor(tau_ref1, t_abs_win, t0_ns, T_laser_ns, harmonic)
         G2_ref, S2_ref, w2 = _reference_phasor(tau_ref2, t_abs_win, t0_ns, T_laser_ns, harmonic)
         print(f"  Reference phasors (this window, decay start t0={t0_ns:.2f} ns):")
@@ -871,9 +1104,11 @@ def process_file(h5file, args):
                             tau_ref1=tau_ref1, tau_ref2=tau_ref2,
                             G1_ref=G1_ref, S1_ref=S1_ref,
                             G2_ref=G2_ref, S2_ref=S2_ref,
-                            show=show)
+                            show=show, curve=curve,
+                            tau_ref=tau_ref, G_ref=G_ref, S_ref=S_ref)
         plot_phasor_maps(result, mask, prefix, f_long=f_long_map,
-                         tau_ref1=tau_ref1, tau_ref2=tau_ref2, show=show)
+                         tau_ref1=tau_ref1, tau_ref2=tau_ref2, show=show,
+                         tau_single=tau_single_map, off_curve=off_curve_map)
 
     # ---- save NPZ (always; project convention is {prefix}_maps.npz) ----
     npz_path = f"{prefix}_maps.npz"
@@ -889,6 +1124,8 @@ def process_file(h5file, args):
         T_laser_ns       = np.float64(T_laser_ns),
         harmonic         = np.int32(harmonic),
         window_mode      = window_mode,
+        decay_model      = decay_model,
+        t0_ns            = np.float64(t0_ns),
         irf_corrected    = np.bool_(result["irf_corrected"]),
         s_tail_start     = np.int32(s_tail_start),
         threshold        = threshold,
@@ -909,13 +1146,24 @@ def process_file(h5file, args):
         save_kw["f_long_window"] = f_long_win_map
         save_kw["w_window_ref1"] = np.float64(w1)
         save_kw["w_window_ref2"] = np.float64(w2)
-        save_kw["t0_ns"]      = np.float64(t0_ns)
         save_kw["tau_ref1_ns"] = np.float64(tau_ref1)
         save_kw["tau_ref2_ns"] = np.float64(tau_ref2)
         save_kw["G_ref1"]     = np.float64(G1_ref)
         save_kw["S_ref1"]     = np.float64(S1_ref)
         save_kw["G_ref2"]     = np.float64(G2_ref)
         save_kw["S_ref2"]     = np.float64(S2_ref)
+    if tau_single_map is not None:
+        save_kw["tau_single"] = tau_single_map
+        save_kw["off_curve"]  = off_curve_map
+        c_tau, c_G, c_S = curve
+        keep = np.unique(np.linspace(0, len(c_tau) - 1, 500).astype(int))
+        save_kw["curve_tau_ns"] = c_tau[keep]
+        save_kw["curve_G"]      = c_G[keep]
+        save_kw["curve_S"]      = c_S[keep]
+    if G_ref is not None:
+        save_kw["tau_ref_ns"] = np.float64(tau_ref)
+        save_kw["G_ref"]      = np.float64(G_ref)
+        save_kw["S_ref"]      = np.float64(S_ref)
     np.savez(npz_path, **save_kw)
     print(f"  saved {npz_path}")
 
@@ -958,9 +1206,16 @@ def main():
     # Phasor options
     p.add_argument("--harmonic", type=int, default=1,
                    help="DFT harmonic (1=fundamental, 2=second, …)")
-    p.add_argument("--window-mode", choices=["tail", "full"], default="tail",
-                   help="Time window: 'tail' (IRF-free, default) or "
-                        "'full' (whole TCSPC window, best with --irf)")
+    p.add_argument("--fit-method", choices=["tail", "irf"], default="tail",
+                   help="Time window: 'tail' (IRF-free, default) or 'irf' "
+                        "(whole TCSPC window + IRF correction; needs --irf)")
+    p.add_argument("--decay-model", choices=["bi", "single"], default="bi",
+                   help="'bi' (default): two reference lifetimes, tie-line, f_long. "
+                        "'single': project onto the single-lifetime curve -> "
+                        "tau_single + off_curve maps")
+    p.add_argument("--tau-ref", type=float, default=None,
+                   help="Single-lifetime mode: optional reference lifetime (ns), "
+                        "marked on the phasor plot")
     p.add_argument("--tau-ref1", type=float, default=None,
                    help="Short-component lifetime (ns) for tie-line + f_long, "
                         "e.g. 1.41 for Flipper-TR")

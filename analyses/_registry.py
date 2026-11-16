@@ -30,6 +30,12 @@ Plugin interface a module must expose to be picked up:
                      this plugin's EXTRA_ARGS values. This is what lets the
                      GUI preview any plugin's data without knowing what
                      kind of splitting (if any) that plugin does.
+
+Optional:
+    GUI_OPTIONS   -- dict telling the GUI which common settings sections
+                     apply to this plugin (see GUI_OPTION_DEFAULTS below).
+                     Any key left out keeps its default, so a plugin that
+                     doesn't declare GUI_OPTIONS gets every section, as before.
 """
 
 import importlib
@@ -37,6 +43,36 @@ import pkgutil
 
 REQUIRED_ATTRS = ("NAME", "DESCRIPTION", "REQUIRES_RAW", "IRF_CAPABLE", "EXTRA_ARGS",
                    "run", "preview_slice")
+
+# Defaults for the optional GUI_OPTIONS dict -- i.e. what a plugin that
+# doesn't declare it gets (every common section shown, all fit methods).
+GUI_OPTION_DEFAULTS = dict(
+    # {fit_method token: label} offered in the fit-method dropdown, in order;
+    # None = every fit method the GUI knows (still filtered by IRF_CAPABLE).
+    fit_methods=None,
+    # Title of the fit-method section (e.g. "Decay window" for phasor).
+    fit_method_title="Fit method",
+    # True = the tail start offset is used in IRF modes too, so keep it visible.
+    tail_offset_with_irf=False,
+    # False = hide Model (mono/bi, fix tau_short, preset, bounds).
+    uses_model=True,
+    # False = hide Lifetime display range (args.lifetime_vlim unused).
+    uses_lifetime_range=True,
+    # Which args.save_* output toggles the plugin honours.
+    outputs=("save_overview", "save_results", "save_quality_plots", "save_irf_check"),
+)
+
+
+def gui_options(mod):
+    """GUI_OPTIONS of a plugin module merged over GUI_OPTION_DEFAULTS."""
+    opts = dict(GUI_OPTION_DEFAULTS)
+    declared = getattr(mod, "GUI_OPTIONS", None) or {}
+    unknown = set(declared) - set(opts)
+    if unknown:
+        print(f"  [plugin loader] '{mod.__name__}': unknown GUI_OPTIONS keys "
+              f"{sorted(unknown)} -- ignored.")
+    opts.update({k: v for k, v in declared.items() if k in opts})
+    return opts
 
 
 def _iter_plugin_modules():
@@ -79,6 +115,7 @@ def list_plugins():
             requires_raw=mod.REQUIRES_RAW,
             irf_capable=mod.IRF_CAPABLE,
             extra_args=list(mod.EXTRA_ARGS),
+            gui=gui_options(mod),
         ))
     plugins.sort(key=lambda p: p["name"])
     return plugins

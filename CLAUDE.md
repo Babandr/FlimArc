@@ -59,6 +59,24 @@ candidate. `_registry.py` keeps only files that expose all of the following.
 | `IRF_CAPABLE` | `bool` | `True` → plugin stays enabled when an IRF fit method is selected. |
 | `EXTRA_ARGS` | `list[str]` | Plugin-specific field names the GUI will render as input widgets. |
 
+### Optional `GUI_OPTIONS` (dict)
+
+Tells the GUI which common settings apply, so unused sections are hidden.
+Any key left out keeps its default (`analyses/_registry.py`,
+`GUI_OPTION_DEFAULTS`); plugins without `GUI_OPTIONS` show everything.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `fit_methods` | `None` (all) | `{token: label}` offered in the fit-method dropdown |
+| `fit_method_title` | `"Fit method"` | Title of that section |
+| `tail_offset_with_irf` | `False` | Keep "Tail start offset" visible in IRF modes |
+| `uses_model` | `True` | `False` hides Model / preset / bounds (and the model tag in the folder name) |
+| `uses_lifetime_range` | `True` | `False` hides Lifetime display range |
+| `outputs` | all four `save_*` | Which output toggles the plugin honours |
+
+The GUI must stay plugin-agnostic: hide sections from this metadata, never
+by checking a plugin id.
+
 **Naming convention:** a module whose name ends in `_wholeimage` is treated as
 a whole-image plugin by the GUI (disables moving-average smoothing, affects
 output folder name). Use this suffix for any plugin that fits the full FOV
@@ -259,18 +277,27 @@ Per-pixel DFT of each histogram at the laser repetition frequency:
 per-pixel optimiser. Uses only two small pooled fits: one for the background
 shapes and one for the IRF offset.
 
-`EXTRA_ARGS` (all GUI text fields; blank = default):
+`EXTRA_ARGS` (str/int/bool accepted; blank = default):
 
 | Name | Default | Meaning |
 |---|---|---|
-| `harmonic` | 1 | DFT harmonic |
-| `window_mode` | `tail` | `tail` (from `_tail_axis` start) or `full` (whole histogram) |
-| `tau_ref1`, `tau_ref2` | none | Reference lifetimes (ns) → tie-line + `f_long` |
+| `harmonic` | 1 | DFT harmonic (GUI dropdown) |
 | `rep_rate_mhz` | none | Laser rep. rate; if blank, period is **assumed** = histogram window (logged) |
-| `subtract_background` | yes | Per-pixel flat background subtraction |
+| `subtract_background` | yes | Flat background subtraction (GUI checkbox) |
+| `decay_model` | `bi` | `bi` (two lifetimes: tie-line, `f_long`) or `single` (single-lifetime curve: `tau_single`, `off_curve`) |
+| `tau_ref` | none | `single` only: reference lifetime (ns), marked on the plot |
+| `tau_ref1`, `tau_ref2` | none | `bi` only: reference lifetimes (ns) → tie-line + `f_long` |
 
-IRF correction uses the common `irf` / `no_shift` / `irf_full` args (the GUI
-only passes `irf` when an IRF fit method is selected).
+In the GUI, `tau_ref` / `tau_ref1` / `tau_ref2` show only for their decay model
+(`"show_if"` in `EXTRA_ARG_SPECS`; hidden fields are also left out of
+`metadata.txt`).
+
+The time window follows the common `fit_method` (no separate setting):
+`"tail"` → tail window; `"irf"` → full window + IRF correction (needs `irf`).
+Other fit methods raise. The old `window_mode` arg/`--window-mode` flag is
+gone; a `window_mode` attribute raises with a pointer to `fit_method`.
+`GUI_OPTIONS` hides Model, preset, bounds and Lifetime display range, and
+keeps the tail offset visible in IRF mode (the background fit uses it).
 
 Science conventions — keep these when editing:
 
@@ -289,14 +316,28 @@ Science conventions — keep these when editing:
   only `B` is used. Skipped with a warning if ill-conditioned.
 - **IRF correction** = `z_data / (z_irf · e^{iω·offset})`, with `offset` the
   physical offset from one pooled `global_reconv_fit`. Valid only for
-  `window_mode="full"` (skipped for `tail`), exact only when the histogram
+  the full window (`fit_method="irf"`), exact only when the histogram
   window spans one full laser period (warns otherwise). If the offset can't be
   measured, the correction is skipped rather than applied with a wrong offset.
 - In tail mode `tau_phase` / `tau_mod` are **not** lifetimes (semicircle
-  formulas don't hold for a truncated window); use `f_long` or G/S.
+  formulas don't hold for a truncated window); use `f_long`, `tau_single` or G/S.
+- **Single-lifetime mode** projects each pixel onto the single-lifetime curve
+  (`single_lifetime_curve`: periodic monoexponentials through the *same*
+  window and `t0` as the reference phasors; the semicircle only in IRF mode).
+  `tau_single` = lifetime of the nearest curve point (valid in tail mode too);
+  `off_curve` = signed distance, + = inner side where mixtures and
+  zero-lifetime scatter fall. NaN where the nearest point is a curve end.
+- **Single-mode background is one image-wide level** (constant of a pooled
+  biexponential + constant fit / number of pixels), and the log says so.
+  Do not "improve" it to per-pixel: a fixed decay shape biases B wherever the
+  lifetime differs from the pooled one; tail bins can't separate per-pixel B
+  from per-pixel tau; and iterating B with each pixel's `tau_single` runs
+  away on non-single-exponential pixels (tested on Flipper-TR: B doubled,
+  points left the curve). Two-lifetime mode keeps its per-pixel tail fit.
 
 Outputs: `{prefix}_maps.npz` (G, S, modulation, tau_phase, tau_mod, n_photons,
-mask, f_long, f_long_window, background_per_bin, irf_shift, …),
+mask, decay_model, t0_ns, f_long, f_long_window, background_per_bin, irf_shift;
+single mode: tau_single, off_curve, curve_tau_ns/curve_G/curve_S, …),
 `_overview.png`, `_phasor_scatter.png`, `_phasor_maps.png`.
 
 ---
