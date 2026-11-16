@@ -15,6 +15,7 @@ launch_ui.bat        Windows launcher shortcut
 analyses/
   _registry.py       Auto-discovers plugins; exposes list_plugins() and get(id)
   normal.py          Per-pixel lifetime map (tail / IRF / mean) — the reference plugin
+  phasor.py          Per-pixel phasor (G, S) — model-free, no per-pixel fitting
   <others>           Whole-image, phase-resolved, timelapse, … (follow same contract)
 
 flim_core/
@@ -71,6 +72,10 @@ set to the output folder and stdout redirected to the log panel.
 - `args` is a plain attribute-holder (not argparse.Namespace from the CLI, but
   compatible). Always read attributes with `getattr(args, name, default)` —
   not every attribute is guaranteed present.
+- **One file per call:** the input is `args.h5file` (singular). A CLI that
+  accepts several files must loop in `main()` and call `run()` once per file.
+- Let exceptions propagate — don't catch-and-print inside `run()`, or the GUI
+  never shows the error.
 - Call `args.cancel_check()` periodically in tight loops and raise
   `AnalysisCancelled` (from `flim_core.fitting`) if it returns `True`.
   The GUI treats `AnalysisCancelled` as a clean user-initiated stop.
@@ -135,8 +140,13 @@ cancel_check       callable() → bool  ← MUST be called in long loops
 
 Plus one attribute per name in `EXTRA_ARGS`. The GUI renders known names
 (`step`, `period`, `groups`, `rolling_window`) with predefined types and
-defaults. Unknown names get a plain text entry; the value arrives as a `str`,
-so the plugin must parse it.
+defaults. Unknown names get a plain text entry; the value arrives as a `str`
+(`""` when left blank), so the plugin must parse it and treat `""` as "use the
+default". `batch_run.py` **requires every** `EXTRA_ARGS` key in each job
+(`""` or `null` is accepted).
+
+Note the external-mask attribute is `external_mask` (not `mask`), and the
+`flim_core.masking.load_mask(path)` helper takes only the path.
 
 ---
 
@@ -232,6 +242,62 @@ These are non-negotiable — do not simplify:
   never swap or relabel the two components.
 - **Uncertainties** are propagated from the Hessian of the Poisson likelihood,
   not from the covariance of a least-squares fit (unless `estimator="leastsq"`).
+- **Never clip background-subtracted counts or levels at 0** — clipping keeps
+  only the positive half of the noise and biases moments and phasors.
+- **IRF/data timing:** IRF files and data have a real timing offset. Measure it
+  with a reconvolution fit (`global_reconv_fit`, free `shift`); never align on
+  the decay *peak* (`estimate_shift`), which lags time zero by ~0.3 ns. The
+  fitted `shift` includes a +0.5-bin model convention
+  (`flim_core.irf._BIN_CONVENTION_SHIFT`); subtract it for the physical offset.
+
+---
+
+## Phasor plugin (`analyses/phasor.py`)
+
+Per-pixel DFT of each histogram at the laser repetition frequency:
+`G + iS = Σ (n_k − B) e^{iωt_k} / Σ (n_k − B)`. Fully vectorised, with no
+per-pixel optimiser. Uses only two small pooled fits: one for the background
+shapes and one for the IRF offset.
+
+`EXTRA_ARGS` (all GUI text fields; blank = default):
+
+| Name | Default | Meaning |
+|---|---|---|
+| `harmonic` | 1 | DFT harmonic |
+| `window_mode` | `tail` | `tail` (from `_tail_axis` start) or `full` (whole histogram) |
+| `tau_ref1`, `tau_ref2` | none | Reference lifetimes (ns) → tie-line + `f_long` |
+| `rep_rate_mhz` | none | Laser rep. rate; if blank, period is **assumed** = histogram window (logged) |
+| `subtract_background` | yes | Per-pixel flat background subtraction |
+
+IRF correction uses the common `irf` / `no_shift` / `irf_full` args (the GUI
+only passes `irf` when an IRF fit method is selected).
+
+Science conventions — keep these when editing:
+
+- **f_long vs f_long_window.** The tie-line projection gives the long
+  component's share of photons *inside the window* (`f_long_window`). For a
+  tail window that overestimates; `f_long` converts it to the whole-decay
+  intensity fraction using each reference lifetime's in-window share.
+- **Reference phasors** are computed numerically through the same window,
+  from a *periodic* decay (repeats every laser period) starting at the decay
+  peak — not from the analytic semicircle. In IRF-corrected mode they start
+  at the IRF origin, sampled at bin centres (`t0 = −½ bin`).
+- **Background** can't be read from the last bins: at 80 MHz a 4.3 ns
+  component is still decaying there (~60 % of those counts are signal, varying
+  per pixel). Instead each pixel's tail is solved linearly as
+  `a1·p1 + a2·p2 + B` with fixed lifetimes (refs, else a pooled `global_fit`);
+  only `B` is used. Skipped with a warning if ill-conditioned.
+- **IRF correction** = `z_data / (z_irf · e^{iω·offset})`, with `offset` the
+  physical offset from one pooled `global_reconv_fit`. Valid only for
+  `window_mode="full"` (skipped for `tail`), exact only when the histogram
+  window spans one full laser period (warns otherwise). If the offset can't be
+  measured, the correction is skipped rather than applied with a wrong offset.
+- In tail mode `tau_phase` / `tau_mod` are **not** lifetimes (semicircle
+  formulas don't hold for a truncated window); use `f_long` or G/S.
+
+Outputs: `{prefix}_maps.npz` (G, S, modulation, tau_phase, tau_mod, n_photons,
+mask, f_long, f_long_window, background_per_bin, irf_shift, …),
+`_overview.png`, `_phasor_scatter.png`, `_phasor_maps.png`.
 
 ---
 
@@ -310,6 +376,9 @@ python -c "from analyses._registry import list_plugins; [print(p['id'], p['modul
 - Keep physical units in variable names where ambiguous (`_ns`, `_bins`).
 - Do not open interactive Matplotlib windows in `run()` — always use
   `plt.savefig()` and `plt.close()`.
+- Keep `print()` text ASCII (`tau`, `->`, not `τ`, `→`): the Windows console
+  (cp1252) raises `UnicodeEncodeError` on CLI/batch runs. Plot labels may use
+  Unicode.
 - Module-level docstrings should state the analysis type and fit method.
 - Private helpers get a leading underscore; only the plugin contract functions
   and `flim_core` public API are considered stable.
