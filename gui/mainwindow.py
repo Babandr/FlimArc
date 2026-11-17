@@ -119,6 +119,14 @@ EXTRA_ARG_SPECS = {
                         "hint": "IRF mode only: divide each pixel by its own IRF from the IRF "
                                 "file, cancelling per-pixel timing offsets (no calibration "
                                 "map needed)."}),
+    "hot_pixels":     ("Hot pixels:", tk.StringVar, "off",
+                       {"kind": "choice", "choices": ["off", "exclude", "subtract"],
+                        "labels": {"off": "Keep",
+                                   "exclude": "Exclude",
+                                   "subtract": "Subtract own bg"},
+                        "hint": "Pixels with high dark counts (3 sigma, from the bins before "
+                                "the rise). Exclude drops them; Subtract own bg removes each "
+                                "one's extra background (single-lifetime mode only)."}),
 }
 
 # Human-readable labels for the two other places in the GUI that pick

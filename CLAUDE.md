@@ -289,6 +289,7 @@ shapes and one for the IRF offset.
 | `tau_ref` | none | `single` only: reference lifetime (ns), marked on the plot |
 | `tau_ref1`, `tau_ref2` | none | `bi` only: reference lifetimes (ns) → tie-line + `f_long` |
 | `per_pixel_irf` | no | IRF mode only: divide each pixel by its own IRF phasor (GUI checkbox) |
+| `hot_pixels` | `off` | `exclude` / `subtract` hot (high dark-count) pixels -- see below |
 
 In the GUI, `tau_ref` / `tau_ref1` / `tau_ref2` show only for their decay model
 (`"show_if"` in `EXTRA_ARG_SPECS`; hidden fields are also left out of
@@ -358,6 +359,24 @@ Science conventions — keep these when editing:
   from per-pixel tau; and iterating B with each pixel's `tau_single` runs
   away on non-single-exponential pixels (tested on Flipper-TR: B doubled,
   points left the curve). Two-lifetime mode keeps its per-pixel tail fit.
+  Exception, opt-in: `hot_pixels="subtract"` (below).
+- **Hot pixels** (`flim_core/hot_pixels.py`): ~11 % of the sensor is switched
+  off by the camera (0 photons, same pixels in every file); of the rest
+  ~6-11 % still have several-fold dark counts (fixed sensor property, 90-98 %
+  the same pixels across files). Their extra flat counts streak the cloud
+  toward the flat-background phasor. Detected from the **pre-rise bins**
+  (lifetime-independent, unlike the tail): pre-rise level vs
+  `b0 + k * photons` (k = previous-pulse remnant), 3 sigma one-sided Poisson,
+  on the raw sensor BEFORE the pixel-offset shift (its circular FFT shift
+  wraps late bins into the pre-rise stretch). `exclude` zeroes them before
+  threshold/binning; `subtract` (single mode) adds each one's excess to the
+  image-wide level, which is lowered by their share
+  (`add_hot_pixel_background`), and drops hot pixels whose *signal* photons
+  fail the threshold (`drop_weak_hot_pixels`) -- without that, pixels that
+  passed on dark counts alone gave NaN / wild values. Fluorescein 40 MHz:
+  tau_single IQR 0.14 -> 0.12 ns, off_curve sd 0.013 -> 0.006, median
+  3.955 -> 4.005 ns (the image-wide level had absorbed the hot pixels'
+  counts and over-subtracted the normal ones).
 
 Outputs: `{prefix}_maps.npz` (G, S, modulation, tau_phase, tau_mod, n_photons,
 mask, decay_model, t0_ns, f_long, f_long_window, background_per_bin, irf_shift;

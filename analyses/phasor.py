@@ -116,6 +116,24 @@ tau_single runs away (B grows, points leave the curve) as soon as a pixel
 is not truly single-exponential (tested on Flipper-TR data).
 An optional reference lifetime (--tau-ref) is marked on the plot.
 
+Hot pixels (hot_pixels: off | exclude | subtract)
+-------------------------------------------------
+Pixels with a high dark-count rate carry extra FLAT counts that the
+image-wide background of single-lifetime mode does not remove; they streak
+from the cloud toward the flat-background phasor (seen on fluorescein,
+40 MHz: ~5 % of pixels, tau_single 4.7 vs 3.95 ns). They are found from the
+bins before the decay rise (flim_core.hot_pixels, 3 sigma above a normal
+pixel of the same brightness), on the raw sensor before any shift/binning.
+  exclude  -- hot pixels get 0 photons (dropped by the threshold / from
+              binned blocks).
+  subtract -- single-lifetime mode only: each hot pixel gets the image-wide
+              level plus its own measured excess; the image-wide level is
+              lowered by the hot pixels' share it contained
+              (add_hot_pixel_background). Pre-rise bins do not depend on the
+              lifetime, so this does not reintroduce the per-pixel-B bias
+              described above. Two-lifetime mode already fits B per pixel.
+Needs ~10+ clean bins before the rise; skipped with a warning otherwise.
+
 Laser period (--rep-rate-mhz)
 -----------------------------
 The phasor frequency is the laser repetition rate. If it is not given, the
@@ -150,7 +168,9 @@ Outputs (per input file)
 """
 
 import argparse
+import contextlib
 import copy
+import io
 from pathlib import Path
 
 import numpy as np
@@ -170,6 +190,7 @@ from flim_core.irf import global_reconv_fit, _BIN_CONVENTION_SHIFT
 from flim_core.plotting import plot_overview_and_mask
 from flim_core.pixel_offset import PixelOffsetCorrection
 from flim_core.bin_pattern import BinPatternCorrection
+from flim_core.hot_pixels import detect_hot_pixels, report as report_hot_pixels
 from analyses._common import build_group_cube
 
 NAME = "Phasor (pixel-wise)"
@@ -183,7 +204,7 @@ IRF_CAPABLE = True     # optional IRF file for phasor-space correction
 # _extra_args() below. The time window is not an extra arg: it follows the
 # common fit_method ("tail" -> tail window, "irf" -> full window + IRF).
 EXTRA_ARGS = ["harmonic", "rep_rate_mhz", "subtract_background", "decay_model",
-              "tau_ref", "tau_ref1", "tau_ref2", "per_pixel_irf"]
+              "tau_ref", "tau_ref1", "tau_ref2", "per_pixel_irf", "hot_pixels"]
 
 # Which common GUI settings apply (see analyses/_registry.py): no lifetime
 # model, bounds or display range; the tail offset is also used in IRF mode
@@ -264,10 +285,27 @@ def _extra_args(args):
     if per_pixel_irf and window_mode != "full":
         print("  NOTE: per_pixel_irf only applies with fit_method='irf' -- ignored.")
         per_pixel_irf = False
+    hp = getattr(args, "hot_pixels", None)
+    hp = "off" if hp is None or not str(hp).strip() else str(hp).strip().lower()
+    if hp in ("off", "no", "none", "false", "0"):
+        hot_pixels = "off"
+    elif hp in ("exclude", "mask", "remove"):
+        hot_pixels = "exclude"
+    elif hp in ("subtract", "background", "own background"):
+        hot_pixels = "subtract"
+    else:
+        raise ValueError(f"hot_pixels = {hp!r}: use 'off', 'exclude' or 'subtract'")
+    if hot_pixels == "subtract" and decay_model == "bi":
+        print("  NOTE: hot_pixels='subtract' only changes single-lifetime mode -- two-lifetime "
+              "mode already fits each pixel's own background. Ignored.")
+        hot_pixels = "off"
+    if hot_pixels == "subtract" and not subtract_bg:
+        print("  NOTE: hot_pixels='subtract' needs background subtraction on -- ignored.")
+        hot_pixels = "off"
     return dict(harmonic=harmonic, window_mode=window_mode, decay_model=decay_model,
                 tau_ref=tau_ref, tau_ref1=tau_ref1, tau_ref2=tau_ref2,
                 rep_rate_mhz=rep_rate_mhz, subtract_bg=subtract_bg,
-                per_pixel_irf=per_pixel_irf)
+                per_pixel_irf=per_pixel_irf, hot_pixels=hot_pixels)
 
 
 def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
@@ -363,6 +401,48 @@ def uniform_background(cube, mask, s, tail_offset):
           f"{100 * np.median(level * cube.shape[2] / np.maximum(n_tot, 1)):.1f}% of all photons "
           f"(median pixel)")
     return B, info
+
+
+def add_hot_pixel_background(B, mask, excess):
+    """hot_pixels='subtract' (single-lifetime mode): give each hot pixel its
+    own extra background on top of the image-wide level.
+
+    excess: per-pixel extra counts per bin (0 for normal pixels), measured
+    in the pre-rise bins (flim_core.hot_pixels) -- independent of the
+    lifetime, unlike a per-pixel level from the tail (see uniform_background).
+    The image-wide level came from the pooled masked tail and so already
+    contains the hot pixels' extra counts spread over all pixels; that share
+    is removed from it first, so the total subtracted background is
+    unchanged and only redistributed to the pixels that carry it.
+    Returns the new map (B is not modified)."""
+    B = B.copy()
+    n = int(mask.sum())
+    ex = np.where(mask, excess, 0.0)
+    level = float(np.median(B[mask]))
+    shift = float(ex.sum()) / max(n, 1)
+    B[mask] = level - shift + ex[mask]
+    n_hot = int((mask & (excess != 0)).sum())
+    print(f"    hot pixels: {n_hot} masked pixel(s) get their own extra background "
+          f"(median {np.median(ex[mask & (excess != 0)]) if n_hot else 0:.2f} counts/bin); "
+          f"image-wide level {level:.3f} -> {level - shift:.3f} counts/bin for the others")
+    return B
+
+
+def drop_weak_hot_pixels(mask, n_photons, B, nb, hot, threshold):
+    """hot_pixels='subtract': a hot pixel can pass the photon threshold on
+    its dark counts alone. Keep a hot pixel only if its SIGNAL photons
+    (photons - background) pass the threshold; normal pixels are untouched.
+    (Fluorescein 40 MHz: 5 hot pixels had more background than photons and
+    gave NaN, ~40 more were mostly background and scattered widely.)
+    threshold None (external mask) -> nothing dropped. Returns the new mask."""
+    if threshold is None:
+        return mask
+    signal = n_photons - B * nb
+    weak = mask & hot & ~(signal > threshold)
+    if weak.any():
+        print(f"    hot pixels: {int(weak.sum())} dropped -- fewer than {threshold:g} signal "
+              f"photons once their background is removed")
+    return mask & ~weak
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1254,21 @@ def process_file(h5file, args):
         except Exception as exc:
             print(f"  WARNING: 8-bin pattern correction failed ({exc}); continuing without it.")
 
+    # ---- hot pixels (optional): detected on the raw sensor, before the
+    # pixel-offset shift (its circular FFT shift wraps late bins into the
+    # pre-rise stretch the detection reads) ----
+    hot_mode = ea["hot_pixels"]
+    hot = hot_excess = None
+    if hot_mode != "off":
+        hp = detect_hot_pixels(cube, n_sigma=3.0)
+        if hp is None:
+            print("  WARNING: hot pixels: no clean stretch before the decay rise in this "
+                  "window -- hot-pixel handling skipped.")
+            hot_mode = "off"
+        else:
+            report_hot_pixels(hp, s["tpb"] * 1e9, int((img > 0).sum()))
+            hot, hot_excess = hp["hot"], hp["excess"]
+
     # ---- pixel-offset correction (optional) ----
     if getattr(args, "pixel_offset", None):
         try:
@@ -1188,10 +1283,31 @@ def process_file(h5file, args):
     if roi is not None:
         img, cube, roi = crop_to_roi(img, cube, roi)
         img_orig = img
+        if hot is not None:
+            x0, y0, x1, y1 = roi
+            hot, hot_excess = hot[y0:y1, x0:x1], hot_excess[y0:y1, x0:x1]
 
     # ---- spatial smoothing (moving average and block binning are exclusive) ----
     moving_avg = getattr(args, "moving_average", None)
     bin_size = getattr(args, "bin", None) or 1
+
+    def _smooth(i, c):
+        """The data's spatial step -- reused for the per-pixel IRF and hot-pixel maps."""
+        if moving_avg and moving_avg > 1:
+            return moving_average_cube(i, c, moving_avg)
+        return bin_cube(i, c, bin_size) if bin_size > 1 else (i, c)
+
+    if hot_mode == "exclude":
+        cube = cube.copy()
+        img = np.array(img, dtype=np.float64)
+        cube[hot] = 0
+        img[hot] = 0
+        print(f"    hot pixels excluded: {int(hot.sum())} pixel(s) set to 0 photons")
+    hot_excess_b = None
+    if hot_mode == "subtract":
+        with contextlib.redirect_stdout(io.StringIO()):
+            _i, _c = _smooth(np.zeros(hot_excess.shape), hot_excess[:, :, None])
+        hot_excess_b = _c[:, :, 0]               # counts per (native) bin, per output pixel
     if moving_avg and moving_avg > 1:
         img, cube = moving_average_cube(img, cube, moving_avg)
         plot_bin_size = 1
@@ -1270,7 +1386,11 @@ def process_file(h5file, args):
     if subtract_bg:
         if decay_model == "single":
             bg_map, bg_info = uniform_background(cube, mask, s, tail_offset)
-            if bg_map is not None:
+            if bg_map is not None and hot_excess_b is not None:
+                bg_map = add_hot_pixel_background(bg_map, mask, hot_excess_b * time_bin)
+                mask = drop_weak_hot_pixels(mask, cube.sum(axis=2), bg_map, cube.shape[2],
+                                            hot_excess_b != 0, threshold)
+            elif bg_map is not None:
                 print("    NOTE: single-lifetime mode takes the background as the same in "
                       "every pixel (a per-pixel level cannot be separated reliably from a "
                       "lifetime that varies per pixel).")
@@ -1307,10 +1427,6 @@ def process_file(h5file, args):
     z_irf_pix = n_irf_pix = None
     if per_pixel_irf and irf_shift is not None:
         print("  Per-pixel IRF: building each pixel's IRF phasor from the IRF file ...")
-        def _smooth(i, c):
-            if moving_avg and moving_avg > 1:
-                return moving_average_cube(i, c, moving_avg)
-            return bin_cube(i, c, bin_size) if bin_size > 1 else (i, c)
         irf_cube, _ = irf_cube_like_data(
             args.irf, sensor_hw, pixel_offset=getattr(args, "pixel_offset", None),
             roi=roi, smooth=_smooth, time_bin=time_bin)
@@ -1461,6 +1577,10 @@ def process_file(h5file, args):
         save_kw["irf_shift"] = np.float64(result["irf_shift_bins"])   # physical offset, bins
     if n_irf_pix is not None:
         save_kw["irf_photons_per_pixel"] = n_irf_pix.astype(np.float32)
+    save_kw["hot_pixel_mode"] = hot_mode
+    if hot is not None:
+        save_kw["hot_pixels"] = hot                      # native pixels (after ROI)
+        save_kw["hot_excess_per_bin"] = hot_excess.astype(np.float32)
     if bg_map is not None:
         save_kw["background_per_bin"] = bg_map.astype(np.float32)
         save_kw["background_taus_ns"] = np.array(bg_info["taus"], dtype=np.float64)
@@ -1564,6 +1684,10 @@ def main():
     p.add_argument("--per-pixel-irf", action="store_true",
                    help="Divide each pixel by its own IRF phasor (cancels per-pixel "
                         "timing offsets; --fit-method irf only)")
+    p.add_argument("--hot-pixels", choices=["off", "exclude", "subtract"], default="off",
+                   help="Hot (high dark-count) pixels, found at 3 sigma from the pre-rise "
+                        "bins: 'exclude' drops them, 'subtract' gives each its own extra "
+                        "background (single-lifetime mode)")
 
     # Misc
     p.add_argument("--tail-start-offset", type=int, default=None,

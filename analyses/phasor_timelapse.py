@@ -419,6 +419,29 @@ def run(args):
     # ---- whole acquisition: mask, axes, IRF offset, background ----
     img_all, cube_all = build_group_cube(d, slice(None))
     report_dead_pixels(img_all)
+    # hot pixels: found once on the whole acquisition (native pixels and bins)
+    hot_mode, hot, hot_excess = ea["hot_pixels"], None, None
+    if hot_mode != "off":
+        from flim_core.hot_pixels import detect_hot_pixels, report as report_hot
+        hp = detect_hot_pixels(cube_all, n_sigma=3.0)
+        if hp is None:
+            print("  WARNING: hot pixels: no clean stretch before the decay rise -- skipped.")
+            hot_mode = "off"
+        else:
+            report_hot(hp, d["tpb"] * 1e9, int((img_all > 0).sum()))
+            hot, hot_excess = hp["hot"], hp["excess"]
+            if hot_mode == "exclude":
+                cube_all[hot] = 0
+                img_all = np.array(img_all, dtype=np.float64)
+                img_all[hot] = 0
+                print(f"    hot pixels excluded: {int(hot.sum())} pixel(s), in every window")
+    hot_excess_b = None
+    if hot_mode == "subtract":
+        a1 = copy.copy(args)
+        a1.time_bin = 1                           # spatial step only; 1-bin "cube"
+        _hi, _hc, _, _, _ = _quiet(apply_spatial_and_time_binning, np.zeros(hot_excess.shape),
+                                   hot_excess[:, :, None].astype(np.float64), d, a1)
+        hot_excess_b = _hc[:, :, 0]               # per native bin, per output pixel
     # spatial smoothing first, time binning separately: the unbinned cube is
     # needed for the IRF offset fit (see ph.irf_offset_binned)
     time_bin = getattr(args, "time_bin", None) or 1
@@ -543,7 +566,14 @@ def run(args):
     if ea["subtract_bg"]:
         if su.decay_model == "single":
             bg_rate, bg_info = ph.uniform_background(cube_all, mask, s, tail_offset)
-            if bg_rate is not None:
+            if bg_rate is not None and hot_excess_b is not None:
+                bg_rate = ph.add_hot_pixel_background(bg_rate, mask, hot_excess_b * time_bin)
+                # threshold is per OUTPUT window: compare per-window signal photons
+                f_w = rw / n_windows
+                mask = ph.drop_weak_hot_pixels(mask, cube_all.sum(axis=2) * f_w, bg_rate * f_w,
+                                               cube_all.shape[2], hot_excess_b != 0, threshold)
+                su.mask = mask
+            elif bg_rate is not None:
                 print("    NOTE: single-lifetime mode takes the background as the same in every pixel.")
         else:
             bg_rate, bg_info = ph.estimate_background(
@@ -563,6 +593,9 @@ def run(args):
         if cancel_check is not None and cancel_check():
             raise AnalysisCancelled(f"Cancelled after {k}/{n_out} windows.")
         img_w, cube_w = build_group_cube(d, slice(boundaries[w - rw_half], boundaries[w + rw_tail]))
+        if hot_mode == "exclude":
+            cube_w[hot] = 0
+            img_w[hot] = 0
         img_w, cube_w, _, _, _ = _quiet(apply_spatial_and_time_binning,
                                         img_w.astype(np.float64), cube_w.astype(np.float64), d, args)
         bg_w = None if bg_rate is None else bg_rate * ((t_hi[k] - t_lo[k]) / dur_s)
@@ -598,6 +631,10 @@ def run(args):
     )
     if irf_corrected:
         save["irf_shift"] = np.float64(su.irf_shift)
+    save["hot_pixel_mode"] = hot_mode
+    if hot is not None:
+        save["hot_pixels"] = hot
+        save["hot_excess_per_bin"] = hot_excess.astype(np.float32)
     if bg_rate is not None:
         save["background_per_bin_whole"] = bg_rate.astype(np.float32)
         save["background_taus_ns"] = np.array(bg_info["taus"], dtype=np.float64)
@@ -645,6 +682,9 @@ def main():
     p.add_argument("--irf-window-end-ns", type=float, default=15.0)
     p.add_argument("--per-pixel-irf", action="store_true",
                    help="divide each pixel by its own IRF phasor (--fit-method irf only)")
+    p.add_argument("--hot-pixels", choices=["off", "exclude", "subtract"], default="off",
+                   help="hot (high dark-count) pixels: exclude, or subtract their own "
+                        "extra background (single-lifetime mode)")
     p.add_argument("--harmonic", type=int, default=1)
     p.add_argument("--rep-rate-mhz", type=float, default=None)
     p.add_argument("--no-subtract-background", dest="subtract_background", action="store_false")
