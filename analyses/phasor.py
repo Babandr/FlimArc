@@ -204,7 +204,8 @@ IRF_CAPABLE = True     # optional IRF file for phasor-space correction
 # _extra_args() below. The time window is not an extra arg: it follows the
 # common fit_method ("tail" -> tail window, "irf" -> full window + IRF).
 EXTRA_ARGS = ["harmonic", "rep_rate_mhz", "subtract_background", "decay_model",
-              "tau_ref", "tau_ref1", "tau_ref2", "per_pixel_irf", "hot_pixels"]
+              "tau_ref", "tau_ref1", "tau_ref2", "per_pixel_irf", "hot_pixels",
+              "show_semicircle"]
 
 # Which common GUI settings apply (see analyses/_registry.py): no lifetime
 # model, bounds or display range; the tail offset is also used in IRF mode
@@ -302,10 +303,15 @@ def _extra_args(args):
     if hot_pixels == "subtract" and not subtract_bg:
         print("  NOTE: hot_pixels='subtract' needs background subtraction on -- ignored.")
         hot_pixels = "off"
+    # Plot only: the universal semicircle is the single-lifetime curve only for
+    # a full-period window, so by default it is hidden whenever the (correct)
+    # single-lifetime curve is drawn. Without that curve it is always shown.
+    show_semicircle = _flag("show_semicircle", False)
     return dict(harmonic=harmonic, window_mode=window_mode, decay_model=decay_model,
                 tau_ref=tau_ref, tau_ref1=tau_ref1, tau_ref2=tau_ref2,
                 rep_rate_mhz=rep_rate_mhz, subtract_bg=subtract_bg,
-                per_pixel_irf=per_pixel_irf, hot_pixels=hot_pixels)
+                per_pixel_irf=per_pixel_irf, hot_pixels=hot_pixels,
+                show_semicircle=show_semicircle)
 
 
 def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
@@ -1065,8 +1071,11 @@ def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15,
 
 def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
                         G1_ref=None, S1_ref=None, G2_ref=None, S2_ref=None,
-                        show=True, curve=None, tau_ref=None, G_ref=None, S_ref=None):
-    """2-D density phasor scatter plot with universal semicircle overlay."""
+                        show=True, curve=None, tau_ref=None, G_ref=None, S_ref=None,
+                        show_semicircle=False):
+    """2-D density phasor scatter plot. Draws the single-lifetime curve when
+    given; the universal semicircle is drawn when show_semicircle is True or
+    when there is no curve (it is then the only lifetime reference)."""
     G_px = result["G"][mask & np.isfinite(result["G"])]
     S_px = result["S"][mask & np.isfinite(result["S"])]
     T = result["T_laser_ns"]
@@ -1076,18 +1085,20 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
     fig, ax = plt.subplots(figsize=(6.5, 5))
 
     # Universal semicircle (G + iS = 1/(1 + iωτ)) at this laser frequency,
-    # always with its own lifetime ticks -- drawn even when the
-    # single-lifetime curve differs (window shorter than the period).
-    theta = np.linspace(0, np.pi, 500)
-    ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),
-            color="#aaaaaa", lw=1.5, zorder=1,
-            label=f"universal semicircle ({1000.0 * h / T:.4g} MHz)")
-    for tau in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]:
-        Gt = 1.0 / (1 + (omega * tau)**2)
-        St = omega * tau / (1 + (omega * tau)**2)
-        ax.plot(Gt, St, "o", ms=2.5, color="#888888", zorder=2)
-        ax.annotate(f"{tau:g}", (Gt, St), textcoords="offset points",
-                    xytext=(-12, -9), fontsize=6, color="#777777")
+    # with its own lifetime ticks. It differs from the single-lifetime curve
+    # when the window is shorter than the period, so it is optional then.
+    draw_semicircle = show_semicircle or curve is None
+    if draw_semicircle:
+        theta = np.linspace(0, np.pi, 500)
+        ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),
+                color="#aaaaaa", lw=1.5, zorder=1,
+                label=f"universal semicircle ({1000.0 * h / T:.4g} MHz)")
+        for tau in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]:
+            Gt = 1.0 / (1 + (omega * tau)**2)
+            St = omega * tau / (1 + (omega * tau)**2)
+            ax.plot(Gt, St, "o", ms=2.5, color="#888888", zorder=2)
+            ax.annotate(f"{tau:g}", (Gt, St), textcoords="offset points",
+                        xytext=(-12, -9), fontsize=6, color="#777777")
     if curve is not None:
         # Single-lifetime curve for THIS window, with lifetime ticks on it
         c_tau, c_G, c_S = curve
@@ -1150,7 +1161,7 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
         refs.append((G_ref, S_ref, "D", "#E05C3A", ""))
     _add_zoom_inset(ax, G_px, S_px, curve=zoom_curve, refs=refs,
                     tie=((G1_ref, S1_ref), (G2_ref, S2_ref)) if G1_ref is not None else None,
-                    semicircle_omega=omega if curve is not None else None)
+                    semicircle_omega=omega if (curve is not None and show_semicircle) else None)
     irf_tag = ((" + per-pixel IRF corr." if result.get("irf_per_pixel") else " + IRF corr.")
                if result.get("irf_corrected") else "")
     ax.set_title(f"Phasor plot  (harmonic {h}, T = {T:.2f} ns{irf_tag})", fontsize=12)
@@ -1557,7 +1568,8 @@ def process_file(h5file, args):
                             G1_ref=G1_ref, S1_ref=S1_ref,
                             G2_ref=G2_ref, S2_ref=S2_ref,
                             show=show, curve=curve,
-                            tau_ref=tau_ref, G_ref=G_ref, S_ref=S_ref)
+                            tau_ref=tau_ref, G_ref=G_ref, S_ref=S_ref,
+                            show_semicircle=ea["show_semicircle"])
         plot_phasor_maps(result, mask, prefix, f_long=f_long_map,
                          tau_ref1=tau_ref1, tau_ref2=tau_ref2, show=show,
                          tau_single=tau_single_map, off_curve=off_curve_map)
@@ -1704,6 +1716,9 @@ def main():
                    help="Hot (high dark-count) pixels, found at 3 sigma from the pre-rise "
                         "bins: 'exclude' drops them, 'subtract' gives each its own extra "
                         "background (single-lifetime mode)")
+    p.add_argument("--show-semicircle", action="store_true",
+                   help="Also draw the universal semicircle when the single-lifetime "
+                        "curve is plotted (hidden by default)")
 
     # Misc
     p.add_argument("--tail-start-offset", type=int, default=None,

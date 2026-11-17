@@ -114,6 +114,11 @@ EXTRA_ARG_SPECS = {
                         "hint": "Optional: both give the tie-line and f_long, and fix the "
                                 "lifetimes used for background subtraction (blank = a "
                                 "pooled biexponential fit with default bounds)."}),
+    "show_semicircle": ("Show universal semicircle", tk.BooleanVar, False,
+                        {"kind": "check", "show_if": ("decay_model", "single"),
+                         "hint": "Plot only. Off: just the single-lifetime curve for this "
+                                 "window (correct when the histogram window is shorter "
+                                 "than the laser period)."}),
     "per_pixel_irf":  ("Per-pixel IRF", tk.BooleanVar, False,
                        {"kind": "check",
                         "hint": "IRF mode only: divide each pixel by its own IRF from the IRF "

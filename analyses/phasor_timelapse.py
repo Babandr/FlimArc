@@ -191,9 +191,16 @@ def plot_trajectory(su, stacks, pooled, t_mid, prefix):
     omega = 2 * np.pi * su.harmonic / su.T
 
     fig, ax = plt.subplots(figsize=(7, 5.4))
-    th = np.linspace(0, np.pi, 400)
-    ax.plot(0.5 + 0.5 * np.cos(th), 0.5 * np.sin(th), color="#cccccc", lw=1.3,
-            label="universal semicircle")
+    if su.show_semicircle or su.curve is None:
+        th = np.linspace(0, np.pi, 400)
+        ax.plot(0.5 + 0.5 * np.cos(th), 0.5 * np.sin(th), color="#aaaaaa", lw=1.3,
+                label=f"universal semicircle ({1000.0 * su.harmonic / su.T:.4g} MHz)")
+        for tau in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]:
+            Gt = 1.0 / (1 + (omega * tau) ** 2)
+            St = omega * tau / (1 + (omega * tau) ** 2)
+            ax.plot(Gt, St, "o", ms=2.5, color="#888888")
+            ax.annotate(f"{tau:g}", (Gt, St), textcoords="offset points", xytext=(-12, -9),
+                        fontsize=6, color="#777777")
     if su.curve is not None:
         c_tau, c_G, c_S = su.curve
         ax.plot(c_G, c_S, color="#7B1FA2", lw=1.2, label="single-lifetime curve (this window)")
@@ -358,6 +365,7 @@ def run(args):
     su = _Setup()
     su.harmonic, su.window_mode, su.decay_model = ea["harmonic"], ea["window_mode"], ea["decay_model"]
     su.tau_ref, su.tau_ref1, su.tau_ref2 = ea["tau_ref"], ea["tau_ref1"], ea["tau_ref2"]
+    su.show_semicircle = ea["show_semicircle"]
 
     stem = Path(args.h5file).stem
     prefix = f"{args.prefix}_{stem}" if getattr(args, "prefix", None) else stem
@@ -685,6 +693,8 @@ def main():
     p.add_argument("--hot-pixels", choices=["off", "exclude", "subtract"], default="off",
                    help="hot (high dark-count) pixels: exclude, or subtract their own "
                         "extra background (single-lifetime mode)")
+    p.add_argument("--show-semicircle", action="store_true",
+                   help="also draw the universal semicircle next to the single-lifetime curve")
     p.add_argument("--harmonic", type=int, default=1)
     p.add_argument("--rep-rate-mhz", type=float, default=None)
     p.add_argument("--no-subtract-background", dest="subtract_background", action="store_false")

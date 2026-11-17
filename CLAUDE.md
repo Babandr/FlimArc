@@ -290,8 +290,9 @@ shapes and one for the IRF offset.
 | `tau_ref1`, `tau_ref2` | none | `bi` only: reference lifetimes (ns) → tie-line + `f_long` |
 | `per_pixel_irf` | no | IRF mode only: divide each pixel by its own IRF phasor (GUI checkbox) |
 | `hot_pixels` | `off` | `exclude` / `subtract` hot (high dark-count) pixels -- see below |
+| `show_semicircle` | no | Plot only: also draw the universal semicircle next to the single-lifetime curve (always drawn when there is no curve, i.e. two-lifetime mode) |
 
-In the GUI, `tau_ref` / `tau_ref1` / `tau_ref2` show only for their decay model
+In the GUI, `tau_ref` / `tau_ref1` / `tau_ref2` / `show_semicircle` show only for their decay model
 (`"show_if"` in `EXTRA_ARG_SPECS`; hidden fields are also left out of
 `metadata.txt`).
 
