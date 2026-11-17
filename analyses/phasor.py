@@ -992,7 +992,8 @@ def _nice_tau_ticks(lo, hi, max_ticks=7):
     return []
 
 
-def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15):
+def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15,
+                    semicircle_omega=None):
     """When the pixel cloud is small compared with the plot, add a zoomed
     inset around it: pixel density, the single-lifetime curve (or universal
     semicircle) with fine lifetime ticks, any reference points / tie-line,
@@ -1000,7 +1001,9 @@ def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15):
 
     curve: (tau, G, S) or None (-> universal semicircle at this omega is
     passed in as a curve by the caller). refs: [(G, S, marker, color, label)].
-    tie: ((G1, S1), (G2, S2)) or None."""
+    tie: ((G1, S1), (G2, S2)) or None.
+    semicircle_omega: if given (rad/ns), also draw the universal semicircle
+    at that frequency in grey, with its own lifetime ticks."""
     ok = np.isfinite(G) & np.isfinite(S)
     G, S = G[ok], S[ok]
     if len(G) < 2:
@@ -1019,6 +1022,19 @@ def _add_zoom_inset(ax, G, S, curve=None, refs=(), tie=None, min_frac=0.15):
     fx = (gm - x0) / (x1 - x0)
     left = 0.06 if fx > 0.5 else 0.52
     ins = ax.inset_axes([left, 0.06, 0.42, 0.42])
+    if semicircle_omega is not None:
+        w = semicircle_omega
+        st = np.geomspace(0.01, 1000.0, 4000)
+        sG, sS = 1 / (1 + (w * st) ** 2), w * st / (1 + (w * st) ** 2)
+        ins.plot(sG, sS, color="#aaaaaa", lw=1.2, zorder=1)
+        sel = (sG > zx[0]) & (sG < zx[1]) & (sS > zy[0]) & (sS < zy[1])
+        if sel.any():
+            for tau in _nice_tau_ticks(st[sel].min(), st[sel].max()):
+                Gt, St = 1 / (1 + (w * tau) ** 2), w * tau / (1 + (w * tau) ** 2)
+                ins.plot(Gt, St, "o", ms=3, color="#888888", zorder=2)
+                ins.annotate(f"{tau:g}", (Gt, St), textcoords="offset points", xytext=(-10, -9),
+                             fontsize=6.5, color="#555555", zorder=7,
+                             bbox=dict(boxstyle="round,pad=0.1", fc="white", ec="none", alpha=0.7))
     if curve is not None:
         c_tau, c_G, c_S = curve
         ins.plot(c_G, c_S, color="#7B1FA2", lw=1.2, zorder=2)
@@ -1059,21 +1075,20 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
 
     fig, ax = plt.subplots(figsize=(6.5, 5))
 
-    # Universal semicircle (G + iS = 1/(1 + iωτ))
+    # Universal semicircle (G + iS = 1/(1 + iωτ)) at this laser frequency,
+    # always with its own lifetime ticks -- drawn even when the
+    # single-lifetime curve differs (window shorter than the period).
     theta = np.linspace(0, np.pi, 500)
     ax.plot(0.5 + 0.5 * np.cos(theta), 0.5 * np.sin(theta),
-            color="#cccccc", lw=1.5, zorder=1, label="universal semicircle")
-
-    # Lifetime ticks on semicircle (reference orientation only)
-    tick_taus = [0.5, 1.0, 1.41, 2.0, 3.0, 4.30, 6.0, 10.0]
-    if curve is None:
-        for tau in tick_taus:
-            Gt = 1.0 / (1 + (omega * tau)**2)
-            St = omega * tau / (1 + (omega * tau)**2)
-            ax.plot(Gt, St, "o", ms=2.5, color="#bbbbbb", zorder=2)
-            ax.annotate(f"{tau}", (Gt, St), textcoords="offset points",
-                        xytext=(2, 2), fontsize=5.5, color="#999999")
-    else:
+            color="#aaaaaa", lw=1.5, zorder=1,
+            label=f"universal semicircle ({1000.0 * h / T:.4g} MHz)")
+    for tau in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 10.0]:
+        Gt = 1.0 / (1 + (omega * tau)**2)
+        St = omega * tau / (1 + (omega * tau)**2)
+        ax.plot(Gt, St, "o", ms=2.5, color="#888888", zorder=2)
+        ax.annotate(f"{tau:g}", (Gt, St), textcoords="offset points",
+                    xytext=(-12, -9), fontsize=6, color="#777777")
+    if curve is not None:
         # Single-lifetime curve for THIS window, with lifetime ticks on it
         c_tau, c_G, c_S = curve
         ax.plot(c_G, c_S, color="#7B1FA2", lw=1.3, zorder=2,
@@ -1134,7 +1149,8 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
     if G_ref is not None:
         refs.append((G_ref, S_ref, "D", "#E05C3A", ""))
     _add_zoom_inset(ax, G_px, S_px, curve=zoom_curve, refs=refs,
-                    tie=((G1_ref, S1_ref), (G2_ref, S2_ref)) if G1_ref is not None else None)
+                    tie=((G1_ref, S1_ref), (G2_ref, S2_ref)) if G1_ref is not None else None,
+                    semicircle_omega=omega if curve is not None else None)
     irf_tag = ((" + per-pixel IRF corr." if result.get("irf_per_pixel") else " + IRF corr.")
                if result.get("irf_corrected") else "")
     ax.set_title(f"Phasor plot  (harmonic {h}, T = {T:.2f} ns{irf_tag})", fontsize=12)
