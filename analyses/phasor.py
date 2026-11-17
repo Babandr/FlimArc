@@ -49,6 +49,26 @@ For tracking RELATIVE lifetime changes in a timelapse on the same
 instrument, IRF correction is optional -- the bias is constant across
 frames and cancels in differences.
 
+Per-pixel IRF (per_pixel_irf, IRF mode only)
+--------------------------------------------
+Every SPAD pixel has its own timing offset (~100-180 ps rms). One pooled
+IRF cannot remove it: each pixel's phasor is rotated by w * its offset,
+which stretches the cloud along the arc (seen as a lifetime spread). With
+per_pixel_irf each pixel is divided by ITS OWN IRF phasor, from the same
+pixel of the IRF file put through the same pixel-offset / ROI / binning /
+time-binning steps as the data -- the pixel's offset is in both and
+cancels, with or without a calibration map. The pooled IRF/data timing
+offset is still measured once and applied to every pixel, after removing
+from it the masked pixels' mean IRF timing relative to the whole sensor
+(reference_per_pixel_irf) -- the per-pixel IRFs already contain that.
+Per-pixel IRF background = mean of that pixel's far tail (same region
+load_irf uses); bins kept = the pooled kernel's window +- 0.5 ns. Pixels
+with < 100 IRF photons fall back to the pooled IRF (logged). The IRF's own
+photon noise adds a little scatter (~0.02 ns at ~3500 IRF photons/pixel);
+on fluorescein (40 MHz) the lifetime spread fell from 0.43 ns (no map,
+pooled IRF) to 0.20 ns -- the same as a correct calibration map with the
+pooled IRF (0.18 ns). Cost: one DFT of the IRF cube (< 0.1 s).
+
 Reference lifetimes (--tau-ref1, --tau-ref2)
 --------------------------------------------
 When both are given (e.g. 1.41 ns and 4.30 ns for Flipper-TR), the plugin:
@@ -163,7 +183,7 @@ IRF_CAPABLE = True     # optional IRF file for phasor-space correction
 # _extra_args() below. The time window is not an extra arg: it follows the
 # common fit_method ("tail" -> tail window, "irf" -> full window + IRF).
 EXTRA_ARGS = ["harmonic", "rep_rate_mhz", "subtract_background", "decay_model",
-              "tau_ref", "tau_ref1", "tau_ref2"]
+              "tau_ref", "tau_ref1", "tau_ref2", "per_pixel_irf"]
 
 # Which common GUI settings apply (see analyses/_registry.py): no lifetime
 # model, bounds or display range; the tail offset is also used in IRF mode
@@ -227,21 +247,27 @@ def _extra_args(args):
     rep_rate_mhz = _num("rep_rate_mhz", float, None)
     if rep_rate_mhz is not None and rep_rate_mhz <= 0:
         raise ValueError(f"rep_rate_mhz must be > 0, got {rep_rate_mhz}")
-    sb = getattr(args, "subtract_background", None)
-    if sb is None or (isinstance(sb, str) and not sb.strip()):
-        subtract_bg = True
-    elif isinstance(sb, str):
-        if sb.strip().lower() in ("1", "true", "yes", "y", "on"):
-            subtract_bg = True
-        elif sb.strip().lower() in ("0", "false", "no", "n", "off"):
-            subtract_bg = False
-        else:
-            raise ValueError(f"subtract_background = {sb!r}: use yes/no")
-    else:
-        subtract_bg = bool(sb)
+    def _flag(name, default):
+        v = getattr(args, name, None)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return default
+        if isinstance(v, str):
+            if v.strip().lower() in ("1", "true", "yes", "y", "on"):
+                return True
+            if v.strip().lower() in ("0", "false", "no", "n", "off"):
+                return False
+            raise ValueError(f"{name} = {v!r}: use yes/no")
+        return bool(v)
+
+    subtract_bg = _flag("subtract_background", True)
+    per_pixel_irf = _flag("per_pixel_irf", False)
+    if per_pixel_irf and window_mode != "full":
+        print("  NOTE: per_pixel_irf only applies with fit_method='irf' -- ignored.")
+        per_pixel_irf = False
     return dict(harmonic=harmonic, window_mode=window_mode, decay_model=decay_model,
                 tau_ref=tau_ref, tau_ref1=tau_ref1, tau_ref2=tau_ref2,
-                rep_rate_mhz=rep_rate_mhz, subtract_bg=subtract_bg)
+                rep_rate_mhz=rep_rate_mhz, subtract_bg=subtract_bg,
+                per_pixel_irf=per_pixel_irf)
 
 
 def estimate_background(cube, mask, s, tail_offset, T_laser_ns, taus=None):
@@ -670,7 +696,99 @@ def irf_offset_binned(args, signal_fine, tpb_fine_ns, time_bin, irf_binned=None)
     return None if sh is None else sh / time_bin
 
 
-def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1):
+def irf_cube_like_data(irf_path, data_hw, pixel_offset=None, roi=None, smooth=None,
+                       time_bin=1, integer_offsets=False):
+    """The IRF file's per-pixel cube, put through the SAME steps as the data
+    so pixel (r, c) of the result sees the same detector pixels as pixel
+    (r, c) of the data: pixel-offset correction (if any), ROI crop, spatial
+    smoothing (`smooth(img, cube) -> (img, cube)`, the data's own step) and
+    time binning. data_hw: the data's (H, W) BEFORE the ROI crop; the IRF
+    sensor must match it. integer_offsets: round offset shifts to whole bins,
+    as raw photon data are corrected (phasor_timelapse)."""
+    s = load_flim_data(irf_path)
+    cube = build_decay_cube(s)
+    if cube.shape[:2] != tuple(data_hw):
+        raise ValueError(f"per-pixel IRF: the IRF file's sensor {cube.shape[:2]} does not match "
+                         f"the data's {tuple(data_hw)}.")
+    if pixel_offset:
+        corr = PixelOffsetCorrection.load(pixel_offset)
+        cube = corr.apply(cube, s["tpb"], integer_bins=integer_offsets)
+    img = cube.sum(axis=2)
+    if roi is not None:
+        img, cube, _ = crop_to_roi(img, cube, roi)
+    if smooth is not None:
+        img, cube = smooth(img, cube)
+    tpb = s["tpb"]
+    if time_bin and time_bin > 1:
+        cube, tpb = bin_time_cube(cube, time_bin, tpb)
+    return cube, tpb
+
+
+def per_pixel_irf_phasor(irf_cube, irf, tpb_ns, nb, T_laser_ns, harmonic, shift_bins,
+                         min_counts=100, margin_ns=0.5):
+    """Each pixel's own IRF phasor on the data's bin grid, rotated by the
+    pooled physical IRF/data offset (shift_bins), like the pooled one in
+    apply_irf_correction.
+
+    irf_cube: from irf_cube_like_data (same grid as the data). irf: the
+    load_irf dict (same time_bin) -- gives the kernel window and the start
+    of the background region. Per pixel: background = mean of its far tail
+    (bins >= irf["bg_start"]), subtracted without clipping; bins kept = the
+    pooled window +- margin_ns (the pixel's own timing may sit off the
+    pooled window by a few hundred ps).
+
+    Returns (z, n): z (H, W) complex, NaN where the pixel has < min_counts
+    background-subtracted IRF photons; n (H, W) those photon counts.
+    """
+    omega = 2.0 * np.pi * harmonic / T_laser_ns
+    nbi = min(nb, irf_cube.shape[2])       # bins shared with the data grid
+    c = irf_cube.astype(np.float64)
+    bg_start = min(int(irf["bg_start"]), c.shape[2] - 1)
+    bg = c[:, :, bg_start:].mean(axis=2)
+    m = int(np.ceil(margin_ns / tpb_ns))
+    lo = max(int(irf["window"][0]) - m, 0)
+    hi = min(int(irf["window"][1]) + m + 1, nbi)
+    h = c[:, :, lo:hi] - bg[:, :, None]
+    t = np.arange(lo, hi) * tpb_ns
+    n = h.sum(axis=2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = (h * np.exp(1j * omega * t)).sum(axis=2) / n
+    z = z * np.exp(1j * omega * shift_bins * tpb_ns)
+    z[~(n >= min_counts) | ~np.isfinite(z) | (np.abs(z) < 1e-10)] = np.nan
+    return z, n
+
+
+def reference_per_pixel_irf(z_pix, irf_grid, tpb_ns, T_laser_ns, harmonic, shift_bins,
+                            weights, mask):
+    """Re-reference per-pixel IRF phasors to the pooled timing fit.
+
+    The IRF/data offset (irf_timing_shift) is fitted between the pooled
+    MASKED data and the WHOLE-SENSOR pooled IRF kernel, so it also absorbs
+    how much later/earlier the masked pixels' IRFs are on average than the
+    whole sensor's (+15-17 ps on the 2026-11-17 fluorescein data). Per-pixel
+    IRFs already contain each pixel's own timing; applying the fitted shift
+    to them as well would count that difference twice (it lowered tau_phase
+    by ~0.03 ns there). So all z_pix are rotated together until their
+    data-weighted mean (weights = the pixels' data counts, as in the pooled
+    fit) has the kernel's phase. Phase only; pixel-to-pixel differences are
+    untouched. Returns (z_pix_rotated, delta_ps) with delta_ps the removed
+    mean difference.
+    """
+    omega = 2.0 * np.pi * harmonic / T_laser_ns
+    k = irf_grid.astype(np.float64)
+    zk = (np.sum(k * np.exp(1j * omega * np.arange(len(k)) * tpb_ns)) / k.sum()
+          * np.exp(1j * omega * shift_bins * tpb_ns))
+    ok = mask & np.isfinite(z_pix) & (weights > 0)
+    if not ok.any():
+        return z_pix, 0.0
+    zm = np.sum(weights[ok] * z_pix[ok]) / np.sum(weights[ok])
+    rot = zk / zm
+    rot /= abs(rot)
+    return z_pix * rot, float(-np.angle(rot) / omega * 1000.0)
+
+
+def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1,
+                         z_irf_pixels=None, mask=None):
     """Correct phasor maps for the IRF by complex division:
 
         z_decay = z_data / (z_irf * exp(i w shift tpb))
@@ -684,6 +802,10 @@ def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1):
     by w*d and biases tau_phase by roughly d (plus a modulation error).
 
     irf_grid: IRF kernel on the data's bin grid (_irf_on_data_grid).
+    z_irf_pixels: optional per-pixel IRF phasors (per_pixel_irf_phasor,
+    already rotated by the offset), same shape as result["G"]. Each pixel is
+    then divided by its own; NaN entries fall back to the pooled one. mask
+    (optional) only limits which pixels the log statistics describe.
     Modifies result dict in-place (G, S, modulation, tau_phase, tau_mod).
     """
     T = result["T_laser_ns"]
@@ -703,7 +825,20 @@ def apply_irf_correction(result, irf_grid, tpb_ns, shift_bins, harmonic=1):
           f"|z|={abs(z_irf):.4f}")
 
     z = result["G"] + 1j * result["S"]
-    z_corr = z / z_irf
+    if z_irf_pixels is None:
+        z_corr = z / z_irf
+    else:
+        zp = np.asarray(z_irf_pixels)
+        sel = np.isfinite(z) if mask is None else (mask & np.isfinite(z))
+        own = sel & np.isfinite(zp)
+        n_fb = int((sel & ~np.isfinite(zp)).sum())
+        if own.any():
+            dt_ps = np.angle(zp[own] / z_irf) / omega * 1000.0
+            print(f"    per-pixel IRF: {int(own.sum())} pixels use their own IRF; timing "
+                  f"spread of the per-pixel IRFs (removed by this) {np.std(dt_ps):.0f} ps rms")
+        if n_fb:
+            print(f"    per-pixel IRF: {n_fb} pixel(s) have too few IRF photons -> pooled IRF")
+        z_corr = z / np.where(np.isfinite(zp), zp, z_irf)
 
     result["G"] = z_corr.real
     result["S"] = z_corr.imag
@@ -920,7 +1055,8 @@ def plot_phasor_scatter(result, mask, prefix, tau_ref1=None, tau_ref2=None,
         refs.append((G_ref, S_ref, "D", "#E05C3A", ""))
     _add_zoom_inset(ax, G_px, S_px, curve=zoom_curve, refs=refs,
                     tie=((G1_ref, S1_ref), (G2_ref, S2_ref)) if G1_ref is not None else None)
-    irf_tag = " + IRF corr." if result.get("irf_corrected") else ""
+    irf_tag = ((" + per-pixel IRF corr." if result.get("irf_per_pixel") else " + IRF corr.")
+               if result.get("irf_corrected") else "")
     ax.set_title(f"Phasor plot  (harmonic {h}, T = {T:.2f} ns{irf_tag})", fontsize=12)
     ax.legend(fontsize=7, loc="upper right", framealpha=0.7)
     fig.tight_layout()
@@ -994,6 +1130,7 @@ def process_file(h5file, args):
     harmonic, window_mode, decay_model = ea["harmonic"], ea["window_mode"], ea["decay_model"]
     tau_ref, tau_ref1, tau_ref2 = ea["tau_ref"], ea["tau_ref1"], ea["tau_ref2"]
     rep_rate_mhz, subtract_bg = ea["rep_rate_mhz"], ea["subtract_bg"]
+    per_pixel_irf = ea["per_pixel_irf"]
     show = not getattr(args, "no_show", True)
 
     stem   = Path(h5file).stem
@@ -1026,6 +1163,7 @@ def process_file(h5file, args):
     img_orig = img   # for the overview panel, before ROI-crop/binning
     report_dead_pixels(img)
     cube = build_decay_cube(s)
+    sensor_hw = cube.shape[:2]          # before ROI -- the per-pixel IRF must match it
 
     # ---- 8-bin TDC pattern correction (optional; same order as normal.py) ----
     if getattr(args, "bin_pattern", False):
@@ -1040,6 +1178,7 @@ def process_file(h5file, args):
     if getattr(args, "pixel_offset", None):
         try:
             corr = PixelOffsetCorrection.load(args.pixel_offset)
+            corr.check_settings(rep_rate_mhz)
             cube = corr.apply(cube, s["tpb"])
         except Exception as exc:
             print(f"  WARNING: pixel offset correction failed ({exc}); continuing without it.")
@@ -1164,6 +1303,36 @@ def process_file(h5file, args):
                 print("  WARNING: the histogram window is shorter than the laser period, "
                       "so the data are not one full period -- IRF correction is approximate.")
 
+    # ---- optional per-pixel IRF phasors (same pixels/grid as the data) ----
+    z_irf_pix = n_irf_pix = None
+    if per_pixel_irf and irf_shift is not None:
+        print("  Per-pixel IRF: building each pixel's IRF phasor from the IRF file ...")
+        def _smooth(i, c):
+            if moving_avg and moving_avg > 1:
+                return moving_average_cube(i, c, moving_avg)
+            return bin_cube(i, c, bin_size) if bin_size > 1 else (i, c)
+        irf_cube, _ = irf_cube_like_data(
+            args.irf, sensor_hw, pixel_offset=getattr(args, "pixel_offset", None),
+            roi=roi, smooth=_smooth, time_bin=time_bin)
+        if irf_cube.shape[:2] != cube.shape[:2]:
+            raise ValueError(f"per-pixel IRF cube {irf_cube.shape[:2]} does not match the "
+                             f"data cube {cube.shape[:2]} after ROI/binning.")
+        z_irf_pix, n_irf_pix = per_pixel_irf_phasor(
+            irf_cube, irf, tpb_ns, nb, T_laser_ns, harmonic, irf_shift)
+        del irf_cube
+        z_irf_pix, delta_ps = reference_per_pixel_irf(
+            z_irf_pix, irf_grid, tpb_ns, T_laser_ns, harmonic, irf_shift,
+            weights=cube.sum(axis=2), mask=mask)
+        print(f"    masked pixels' IRFs are {delta_ps:+.1f} ps vs the whole-sensor IRF on "
+              f"average; already in the fitted offset, so removed from the per-pixel IRFs")
+        n_med = float(np.median(n_irf_pix[mask]))
+        # phase noise of a phasor from N photons ~ 1/(|z| sqrt(2N)) rad
+        noise_ps = 1000.0 / (2 * np.pi * harmonic / T_laser_ns) / np.sqrt(2 * max(n_med, 1.0))
+        print(f"    median {n_med:.0f} IRF photons per pixel -> the IRF's own photon noise "
+              f"adds ~{noise_ps:.0f} ps timing scatter per pixel")
+    elif per_pixel_irf:
+        print("  NOTE: per-pixel IRF skipped -- the IRF correction itself is off.")
+
     # ---- compute phasor ----
     print(f"  Phasor: harmonic={harmonic}, window='{window_mode}' [{win_label}], "
           f"T={T_laser_ns:.2f} ns, decay model '{decay_model}' ...")
@@ -1172,8 +1341,10 @@ def process_file(h5file, args):
     result["irf_corrected"] = False
     if irf_shift is not None:
         print("  Applying IRF correction in phasor space ...")
-        apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic)
+        apply_irf_correction(result, irf_grid, tpb_ns, irf_shift, harmonic=harmonic,
+                             z_irf_pixels=z_irf_pix, mask=mask)
         result["irf_shift_bins"] = irf_shift
+        result["irf_per_pixel"] = z_irf_pix is not None
 
     del cube_fine
 
@@ -1276,6 +1447,7 @@ def process_file(h5file, args):
         decay_model      = decay_model,
         t0_ns            = np.float64(t0_ns),
         irf_corrected    = np.bool_(result["irf_corrected"]),
+        irf_per_pixel    = np.bool_(z_irf_pix is not None and result["irf_corrected"]),
         s_tail_start     = np.int32(s_tail_start),
         threshold        = threshold,
         min_neighbors    = min_nb,
@@ -1287,6 +1459,8 @@ def process_file(h5file, args):
     )
     if "irf_shift_bins" in result:
         save_kw["irf_shift"] = np.float64(result["irf_shift_bins"])   # physical offset, bins
+    if n_irf_pix is not None:
+        save_kw["irf_photons_per_pixel"] = n_irf_pix.astype(np.float32)
     if bg_map is not None:
         save_kw["background_per_bin"] = bg_map.astype(np.float32)
         save_kw["background_taus_ns"] = np.array(bg_info["taus"], dtype=np.float64)
@@ -1387,6 +1561,9 @@ def main():
                    help="Keep full IRF trace (echoes); default: window to main peak")
     p.add_argument("--irf-window-end-ns", type=float, default=15.0,
                    help="End of IRF window in ns past the peak (--irf-full only)")
+    p.add_argument("--per-pixel-irf", action="store_true",
+                   help="Divide each pixel by its own IRF phasor (cancels per-pixel "
+                        "timing offsets; --fit-method irf only)")
 
     # Misc
     p.add_argument("--tail-start-offset", type=int, default=None,

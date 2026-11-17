@@ -1,0 +1,18 @@
+{
+  "description": "Per-pixel SPAD timing offset (ps) relative to the sensor-wide median, from cross-correlation of each pixel's IRF with the re-aligned pooled IRF (sub-bin; flim_core.pixel_offset.estimate_offsets_from_irf). Orientation as returned by flim_core.io.load_flim_data. NaN = fewer than 30 IRF photons.",
+  "source_file": "40x_foil_irf_nd3_low100p_40MHz_26e-9_3560_30s.ds3d",
+  "rep_rate_mhz": 40.0,
+  "sync_delay": 3560,
+  "tpb_ps": 37.4,
+  "sensor_shape_hw": [
+    126,
+    192
+  ],
+  "offset_std_ps": 180.401755234083,
+  "median_irf_counts_per_pixel": 11193.050847457633,
+  "valid_pixels": 21389,
+  "total_pixels": 24192,
+  "units": "picoseconds",
+  "created": "2026-11-17",
+  "notes": "40x objective, foil, nd3, low 100%, 30 s, 2026-11-17. Checked against 3 other 40 MHz/3560 foil IRFs (nd3/nd4, focus/no focus): r = 0.99-1.00, 9-24 ps rms apart."
+}

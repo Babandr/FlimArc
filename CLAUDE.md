@@ -288,6 +288,7 @@ shapes and one for the IRF offset.
 | `decay_model` | `bi` | `bi` (two lifetimes: tie-line, `f_long`) or `single` (single-lifetime curve: `tau_single`, `off_curve`) |
 | `tau_ref` | none | `single` only: reference lifetime (ns), marked on the plot |
 | `tau_ref1`, `tau_ref2` | none | `bi` only: reference lifetimes (ns) → tie-line + `f_long` |
+| `per_pixel_irf` | no | IRF mode only: divide each pixel by its own IRF phasor (GUI checkbox) |
 
 In the GUI, `tau_ref` / `tau_ref1` / `tau_ref2` show only for their decay model
 (`"show_if"` in `EXTRA_ARG_SPECS`; hidden fields are also left out of
@@ -332,6 +333,16 @@ Science conventions — keep these when editing:
   the full window (`fit_method="irf"`), exact only when the histogram
   window spans one full laser period (warns otherwise). If the offset can't be
   measured, the correction is skipped rather than applied with a wrong offset.
+- **Per-pixel IRF** (`per_pixel_irf`): each pixel's IRF comes from the same
+  pixel of the IRF file, put through the data's own pixel-offset / ROI /
+  binning / time-binning steps (`irf_cube_like_data`), so the pixel's TDC
+  offset cancels with or without a calibration map. The pooled offset fit
+  already contains the masked pixels' mean IRF timing vs the whole sensor
+  (+15-20 ps here); `reference_per_pixel_irf` removes it from the per-pixel
+  IRFs -- don't drop that step (it shifted tau_phase by -0.03 ns). Timelapse:
+  the pooled trace divides by the signal-weighted mean of the pixels' IRF
+  phasors (exact for a sum of pixels). Check: per-pixel and pooled IRF with a
+  correct map give the same median (within ~0.01 ns).
 - In tail mode `tau_phase` / `tau_mod` are **not** lifetimes (semicircle
   formulas don't hold for a truncated window); use `f_long`, `tau_single` or G/S.
 - **Single-lifetime mode** projects each pixel onto the single-lifetime curve
@@ -379,6 +390,21 @@ Check: one window spanning the whole run reproduces `phasor.py` (G/S within
 Outputs: `_maps.npz` (stacks `[n_windows, H, W]`, `pooled_*` traces,
 `t_start_s`/`t_end_s`/`t_mid_s`, …), `_overview.png`,
 `_phasor_trajectory.png`, `_phasor_timecourse.png`, `_phasor_frames.png`.
+
+## Pixel-offset calibration (`flim_core/pixel_offset.py`, `calibration/`)
+
+Per-pixel SPAD timing offsets (~100-180 ps rms). **The map depends on the
+laser rep. rate / sync delay**: 20 MHz and 40 MHz/3560 maps correlate at
+r = -0.6, and the wrong map makes timing worse (pooled IRF 490 -> 670 ps
+instead of -> 190 ps). One map per setting in `calibration/`, named with the
+setting, `rep_rate_mhz` / `sync_delay` in the `_meta.json`. Build from a foil
+IRF taken at the data's settings:
+`python -m flim_core.pixel_offset IRF.ds3d --out calibration/NAME.npy --rep-rate-mhz 40 --sync-delay 3560`.
+`load_irf` checks the map against the IRF (`check_against_irf`, warns if it
+doesn't remove the IRF's timing spread); phasor plugins also compare the
+map's rate with `rep_rate_mhz` (`check_settings`). The GUI pre-selects a map
+only when `calibration/` holds exactly one. `apply()` is vectorised
+(scipy.fft, ~0.6 s per cube); `integer_bins=True` matches the raw-photon path.
 
 ## Output conventions
 

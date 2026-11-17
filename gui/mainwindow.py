@@ -114,6 +114,11 @@ EXTRA_ARG_SPECS = {
                         "hint": "Optional: both give the tie-line and f_long, and fix the "
                                 "lifetimes used for background subtraction (blank = a "
                                 "pooled biexponential fit with default bounds)."}),
+    "per_pixel_irf":  ("Per-pixel IRF", tk.BooleanVar, False,
+                       {"kind": "check",
+                        "hint": "IRF mode only: divide each pixel by its own IRF from the IRF "
+                                "file, cancelling per-pixel timing offsets (no calibration "
+                                "map needed)."}),
 }
 
 # Human-readable labels for the two other places in the GUI that pick
@@ -873,7 +878,9 @@ class FlimMasterApp(tk.Tk):
             f_off,
             text="Corrects the fixed per-pixel TDC offset measured from an IRF "
                  "calibration file (.npy). Apply before fitting to remove systematic "
-                 "timing spread (~103 ps rms) across the sensor. "
+                 "timing spread (~100-180 ps rms) across the sensor. The map depends "
+                 "on the laser rep. rate / sync delay: pick one made at the data's "
+                 "settings (build: python -m flim_core.pixel_offset). "
                  "Uncheck to run without correction for a side-by-side comparison.",
             foreground="#777", font=("", 8), wraplength=260,
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4)
@@ -950,16 +957,42 @@ class FlimMasterApp(tk.Tk):
             w.config(state=state)
 
     @staticmethod
-    def _find_default_calibration() -> Path | None:
-        """Return the path to the default calibration file if it exists.
+    def _calibration_dir() -> Path:
+        """<repo_root>/calibration, where <repo_root> contains this gui/ package."""
+        return Path(__file__).resolve().parent.parent / "calibration"
 
-        Looks for  <repo_root>/calibration/spad_pixel_offset_calibration.npy
-        where <repo_root> is the directory that contains this gui/ package.
-        Returns None silently if the file is not found so the checkbox still
-        works -- the user can pick a file manually."""
-        here = Path(__file__).resolve().parent   # gui/
-        candidate = here.parent / "calibration" / "spad_pixel_offset_calibration.npy"
-        return candidate if candidate.exists() else None
+    @classmethod
+    def _find_default_calibration(cls) -> Path | None:
+        """The calibration map to pre-select: only when calibration/ holds
+        exactly ONE .npy. With several (one per laser/sync setting) nothing is
+        pre-selected -- picking the wrong one makes the timing worse, so the
+        user chooses."""
+        d = cls._calibration_dir()
+        maps = sorted(d.glob("*.npy")) if d.is_dir() else []
+        return maps[0] if len(maps) == 1 else None
+
+    @staticmethod
+    def _calibration_settings_text(path) -> str:
+        """'40 MHz, delay 3560' from the map's _meta.json, or '' if unknown."""
+        import json
+        p = Path(path)
+        meta_path = p.with_name(p.stem + "_meta.json")
+        try:
+            with open(meta_path) as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            return ""
+        parts = []
+        if meta.get("rep_rate_mhz") is not None:
+            parts.append(f"{meta['rep_rate_mhz']:g} MHz")
+        if meta.get("sync_delay") is not None:
+            parts.append(f"delay {meta['sync_delay']}")
+        return ", ".join(parts)
+
+    def _show_pixel_offset_choice(self, path, default=False):
+        info = self._calibration_settings_text(path)
+        text = Path(path).name + (f"  [{info}]" if info else "") + ("  (default)" if default else "")
+        self._pixel_offset_label.config(text=text, foreground="#4a9" if default else "#333")
 
     def _update_pixel_offset_state(self):
         enabled = self.pixel_offset_var.get()
@@ -974,26 +1007,28 @@ class FlimMasterApp(tk.Tk):
                 default = self._find_default_calibration()
                 if default is not None:
                     self.pixel_offset_path = str(default)
-                    self._pixel_offset_label.config(
-                        text=f"{default.name}  (default)", foreground="#4a9")
+                    self._show_pixel_offset_choice(default, default=True)
                 else:
+                    d = self._calibration_dir()
+                    n = len(list(d.glob("*.npy"))) if d.is_dir() else 0
                     self._pixel_offset_label.config(
-                        text="Default not found — please select a file",
+                        text=(f"{n} calibration maps available -- select the one made at "
+                              f"this data's laser/sync settings" if n > 1 else
+                              "No calibration found -- please select a file"),
                         foreground="#c84")
 
     def _select_pixel_offset_file(self):
-        # Start the file picker in the default calibration directory if it exists
-        default = self._find_default_calibration()
-        initial_dir = str(default.parent) if default else None
+        # Start the file picker in the calibration directory if it exists
+        d = self._calibration_dir()
         path = filedialog.askopenfilename(
-            initialdir=initial_dir,
+            initialdir=str(d) if d.is_dir() else None,
             filetypes=[("NumPy array", "*.npy"), ("All files", "*.*")],
             title="Select pixel offset calibration .npy file",
         )
         if not path:
             return
         self.pixel_offset_path = path
-        self._pixel_offset_label.config(text=Path(path).name, foreground="#333")
+        self._show_pixel_offset_choice(path)
 
     def _update_irf_window_end_state(self):
         self.irf_window_end_entry.config(state="normal" if self.irf_full_var.get() else "disabled")

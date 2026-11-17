@@ -108,6 +108,10 @@ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
         from .pixel_offset import PixelOffsetCorrection
         try:
             corr = PixelOffsetCorrection.load(pixel_offset_path)
+            try:   # does the map fit this IRF? (it depends on laser/sync settings)
+                corr.check_against_irf(cube, s["tpb"])
+            except Exception as exc:
+                print(f"  [load_irf] (calibration check skipped: {exc})")
             cube = corr.apply(cube, s["tpb"])
             print(f"  [load_irf] pixel offset correction applied to IRF cube "
                   f"({corr.valid_mask.sum()} / {corr.offset_ps.size} pixels corrected)")
@@ -183,7 +187,7 @@ def load_irf(path, window=True, window_end_ns=15.0, time_bin=1,
 
     return dict(raw=raw, irf_norm=irf_norm, tpb=s["tpb"], nb=len(raw),
                 peak_bin=peak_bin, fwhm_bins=fwhm_bins, fwhm_ns=fwhm_ns,
-                bg_level=bg_level,
+                bg_level=bg_level, bg_start=tail_start,
                 bg_fraction=bg_fraction, window=(left, right), echo_fraction=echo_fraction,
                 n_photons=s["n_photons"], source=s["source"], windowed=window,
                 pixel_offset_corrected=(pixel_offset_path is not None))

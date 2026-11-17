@@ -6,6 +6,9 @@
   "laser_power": "low 100%",
   "nd_filter": "0.5",
   "exposure_s": 120,
+  "rep_rate_mhz": 20,
+  "sync_delay": null,
+  "settings_note": "Settings were not recorded at creation; 20 MHz inferred on 2026-11-17: this map matches the 20 MHz / sync delay 2880 foil IRFs of that day (r = 0.97, 25 ps rms) and does NOT fit 40 MHz / delay 3560 data (r = -0.6). Sync delay of the source acquisition unknown.",
   "tpb_ps": 37.4,
   "sensor_shape_hw": [
     126,
